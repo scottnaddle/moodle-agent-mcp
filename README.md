@@ -13,8 +13,8 @@
 |---|---|
 | `src/moodle_mcp/`, `tests/` | FastMCP(Python 3.12) Streamable-HTTP MCP 서버 — 도구 **39개**, Bearer 인증 |
 | `Dockerfile`, `deploy/docker-compose.yml`, `.env.example` | 컨테이너 빌드/실행 |
-| `plugins/local_grokbot/` | 서버가 의존하는 Moodle 로컬 플러그인 (v0.3.0, WS 함수 9개) |
-| `moodle-setup/setup_grokbot_ws.php` | Moodle 쪽 자동 설정 CLI (웹서비스·REST·서비스 사용자·역할·외부 서비스·토큰) |
+| [moodle-local_ubionai](https://github.com/scottnaddle/moodle-local_ubionai) (별도 리포) | 서버가 의존하는 Moodle 로컬 플러그인 `local_ubionai` (v0.1.0, WS 함수 9개). 이전 이름 `local_grokbot` |
+| `moodle-setup/setup_ubionai_ws.php` | Moodle 쪽 자동 설정 CLI (웹서비스·REST·서비스 사용자·역할·외부 서비스·토큰) |
 | `deploy/nginx/mcp.conf.template`, `deploy/TLS_CLOUDFLARE.md` | 리버스 프록시·TLS 템플릿 (도메인은 변수) |
 | `client/moodle-mcp-remote.sh` | Grok Bot/아무 MCP 클라이언트용 stdio 래퍼 (mcp-remote) |
 | `scripts/smoke_test.py` | 설치 후 동작 확인 |
@@ -29,8 +29,8 @@ flowchart LR
   G[Grok Bot / MCP 클라이언트] -- stdio --> R[mcp-remote 래퍼]
   R -- "HTTPS + Bearer<br/>Streamable HTTP /mcp" --> N[nginx / Cloudflare]
   N --> S[Moodle MCP 서버<br/>Docker · 127.0.0.1:8791]
-  S -- "REST wstoken<br/>core_* / mod_*" --> M[(Moodle 5.x<br/>Web Services)]
-  S -- "REST wstoken<br/>local_grokbot_*" --> P[local_grokbot 플러그인]
+  S -- "REST wstoken<br/>core_* / mod_*" --> M[(Moodle 5.3+<br/>Web Services)]
+  S -- "REST wstoken<br/>local_ubionai_*" --> P[local_ubionai 플러그인]
   P --- M
 ```
 
@@ -72,7 +72,7 @@ flowchart LR
 | 28 | `set_rubric` | 쓰기 | Define (or replace) the rubric of an activity. |
 | 29 | `set_grade_categories` | 쓰기 | Organise the gradebook into weighted categories under the course total and move activities' grade items into them. |
 | 30 | `create_badge` | 쓰기 | Create a course badge awarded when all activity_cmids are completed and/or the course is completed with at least min_course_grade. |
-| 31 | `update_activity` | 쓰기 | Update an activity (local_grokbot_update_module). |
+| 31 | `update_activity` | 쓰기 | Update an activity (local_ubionai_update_module). |
 | 32 | `set_activity_visibility` | 쓰기 | Show or hide an activity on the course page. |
 | 33 | `set_completion` | 쓰기 | Set the completion rule of an activity. |
 | 34 | `set_access_restriction` | 쓰기 | Restrict access to an activity (target = cmid) or a section (target = section number): require completion of required_cmids and/or a start date open_from (unix timestamp). |
