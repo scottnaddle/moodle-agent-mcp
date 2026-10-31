@@ -60,11 +60,16 @@ _USER_CONTAINER_KEYS = frozenset(
     {"users", "participants", "members", "students", "author", "user"}
 )
 _USER_MARKER_KEYS = frozenset(
-    {"firstname", "lastname", "email", "emailaddress", "username", "idnumber", "userid"}
+    {"firstname", "lastname", "email", "emailaddress", "username", "userid"}
 )
 # Names of non-user objects (courses, categories, activities) are kept as-is,
 # including from heuristic name detection, unless the object is user-like.
 _PLAIN_OBJECT_FIELDS = frozenset({"fullname", "shortname"})
+# Short title fields of non-user objects: heuristic Korean-name detection causes
+# false positives here; seeded known names are still masked.
+_TITLE_FIELDS = frozenset(
+    {"name", "sectionname", "modname", "categoryname", "coursename", "groupname", "displayname"}
+)
 
 
 def _looks_like_user(value: object) -> bool:
@@ -545,6 +550,8 @@ class Pseudonymizer:
                     return self._allocate(category, value)
             elif isinstance(key, str) and key.lower() in _PLAIN_OBJECT_FIELDS:
                 return value
+            elif isinstance(key, str) and key.lower() in _TITLE_FIELDS:
+                return self.pseudonymize(value, heuristic=False)
             return self.pseudonymize(value)
         if isinstance(value, bool):
             return value
@@ -596,7 +603,7 @@ class Pseudonymizer:
         sentinels[sentinel] = placeholder
         return sentinel
 
-    def pseudonymize(self, text: str) -> str:
+    def pseudonymize(self, text: str, *, heuristic: bool = True) -> str:
         if not text:
             return text
 
@@ -617,18 +624,19 @@ class Pseudonymizer:
                 lambda match: replace(match.group(0), "name"), result
             )
 
-        pieces: list[str] = []
-        index = 0
-        while index < len(result):
-            match = _heuristic_match_at(result, index)
-            if match is None:
-                pieces.append(result[index])
-                index += 1
-                continue
-            _, candidate, _ = match
-            pieces.append(replace(candidate, "name"))
-            index += len(candidate)
-        result = "".join(pieces)
+        if heuristic:
+            pieces: list[str] = []
+            index = 0
+            while index < len(result):
+                match = _heuristic_match_at(result, index)
+                if match is None:
+                    pieces.append(result[index])
+                    index += 1
+                    continue
+                _, candidate, _ = match
+                pieces.append(replace(candidate, "name"))
+                index += len(candidate)
+            result = "".join(pieces)
 
         result = _EMAIL_RE.sub(lambda match: replace(match.group(0), "email"), result)
         result = _RESIDENT_ID_RE.sub(

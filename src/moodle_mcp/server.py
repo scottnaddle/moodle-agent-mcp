@@ -125,7 +125,10 @@ WRITE_FUNCTIONS = frozenset(
     }
 )
 _LOCAL_WRITE_PREFIX = "local_ubionai_"
-_LOCAL_READ_FUNCTIONS = frozenset({"local_ubionai_get_course_assignments"})
+_LOCAL_READ_FUNCTIONS = frozenset({
+    "local_ubionai_get_course_assignments",
+    "local_ubionai_list_course_assignments",
+})
 
 
 def _is_write(wsfunction: str) -> bool:
@@ -403,38 +406,120 @@ def create_mcp(client: MoodleClient | None) -> FastMCP:
         return await call("core_enrol_get_enrolled_users", key="users", courseid=course_id)
 
     @mcp.tool()
-    async def list_assignments(course_ids: list[int] | None = None) -> dict[str, Any]:
+    async def list_assignments(
+        course_ids: list[int] | None = None,
+        offset: int = 0,
+        limit: int = 25,
+    ) -> dict[str, Any]:
         """List assignments, grouped by course. Omit course_ids for all accessible courses.
 
-        Courses the service user is not enrolled in are fetched via the optional
-        local_ubionai_get_course_assignments fallback (tagged source=local_ubionai).
+        offset/limit page through all courses that have assignments and apply only
+        when course_ids is omitted. Courses the service user is not enrolled in come
+        from the local_ubionai plugin (tagged source=local_ubionai); results include
+        a paging block with next_offset.
         """
+        offset = max(0, int(offset))
+        limit = min(100, max(1, int(limit)))
+
         res = await call("mod_assign_get_assignments", courseids=course_ids or None)
         if not isinstance(res, dict) or "error" in res:
             return res
 
         fallback_errors: list[dict[str, Any]] = []
-        missing: list[int] = []
+        seen: set[int] = set()
         if isinstance(res.get("courses"), list):
             seen = {int(c["id"]) for c in res["courses"] if isinstance(c, dict) and "id" in c}
-            missing = [cid for cid in (course_ids or []) if cid not in seen]
 
-        for courseid in missing:
+        if course_ids:
+            for courseid in [cid for cid in course_ids if cid not in seen]:
+                extra = await call("local_ubionai_get_course_assignments", courseid=courseid)
+                if isinstance(extra, dict) and "error" not in extra:
+                    for course in extra.get("courses", []):
+                        if isinstance(course, dict):
+                            course["source"] = "local_ubionai"
+                            res.setdefault("courses", []).append(course)
+                    res.setdefault("warnings", []).extend(extra.get("warnings", []))
+                else:
+                    error = extra.get("error") if isinstance(extra, dict) else str(extra)
+                    fallback_errors.append({"courseid": courseid, "error": str(error)})
+                    res["hint"] = OPTIONAL_HINT.format(plugin="local_ubionai")
+            if fallback_errors:
+                res["fallback_errors"] = fallback_errors
+            return res
+
+        # No course_ids: primary paged enumeration through the plugin.
+        page = await call("local_ubionai_list_course_assignments", offset=offset, limit=limit)
+        page_error = page.get("error") if isinstance(page, dict) else str(page)
+        if isinstance(page, dict) and "error" not in page:
+            # Core mod_assign results are only included on the first page; later pages
+            # come entirely from the plugin so enrolled courses do not repeat.
+            if offset != 0:
+                res["courses"] = []
+            for course in page.get("courses", []):
+                if isinstance(course, dict) and int(course.get("id", 0)) not in seen:
+                    course["source"] = "local_ubionai"
+                    res.setdefault("courses", []).append(course)
+                    seen.add(int(course["id"]))
+            res.setdefault("warnings", []).extend(page.get("warnings", []))
+            total = int(page.get("total", 0))
+            res["paging"] = {
+                "offset": offset,
+                "limit": limit,
+                "total": total,
+                "next_offset": offset + limit if offset + limit < total else None,
+            }
+            return res
+
+        # Degraded fallback (0.4.x plugin or Connect not re-run after upgrade).
+        cc = await call("core_course_get_courses", key="courses")
+        if not isinstance(cc, dict) or "error" in cc or not isinstance(cc.get("courses"), list):
+            res["hint"] = OPTIONAL_HINT.format(plugin="local_ubionai")
+            return res
+
+        # Read id/format first: both are pseudonymisation-safe (ints are never masked;
+        # format values like "site" are ASCII and untouched by the name detectors).
+        ids = sorted(
+            int(c["id"])
+            for c in cc["courses"]
+            if isinstance(c, dict) and int(c.get("id", 0)) != 1 and c.get("format") != "site"
+        )
+        ids = [cid for cid in ids if cid not in seen]
+        window = ids[offset:offset + limit]
+
+        # As in the plugin path, core mod_assign results belong to the first page only.
+        if offset != 0:
+            res["courses"] = []
+
+        degraded_errors: list[dict[str, Any]] = []
+        for courseid in window:
             extra = await call("local_ubionai_get_course_assignments", courseid=courseid)
             if isinstance(extra, dict) and "error" not in extra:
                 for course in extra.get("courses", []):
-                    if isinstance(course, dict):
+                    if isinstance(course, dict) and course.get("assignments"):
                         course["source"] = "local_ubionai"
                         res.setdefault("courses", []).append(course)
                 res.setdefault("warnings", []).extend(extra.get("warnings", []))
             else:
                 error = extra.get("error") if isinstance(extra, dict) else str(extra)
-                fallback_errors.append({"courseid": courseid, "error": str(error)})
-                res["hint"] = OPTIONAL_HINT.format(plugin="local_ubionai")
+                degraded_errors.append({"courseid": courseid, "error": str(error)})
 
-        if fallback_errors:
-            res["fallback_errors"] = fallback_errors
-        if not course_ids and not res.get("courses"):
+        res["paging"] = {
+            "offset": offset,
+            "limit": limit,
+            "total": len(ids),
+            "next_offset": offset + limit if offset + limit < len(ids) else None,
+        }
+        res["degraded"] = (
+            "local_ubionai_list_course_assignments unavailable; re-run Connect in the plugin"
+        )
+        if page_error:
+            res["plugin_error"] = str(page_error)
+            res["degraded"] += f" (plugin error: {page_error})"
+        if degraded_errors:
+            res["fallback_errors"] = degraded_errors
+        if (not window and offset == 0) or (degraded_errors and not res.get("courses")):
+            res["hint"] = OPTIONAL_HINT.format(plugin="local_ubionai")
+        if not ids and not seen and not res.get("courses"):
             res["hint"] = (
                 "No courses returned; the service user is not enrolled in any course. "
                 "Pass course_ids to list assignments for specific courses."
