@@ -9,3 +9,5 @@ build/
 dist/
 .pytest_cache/
 .coverage
+deploy/docker-compose.override.yml
+deploy/IMAGE_HISTORY.txt

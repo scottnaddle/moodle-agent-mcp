@@ -124,6 +124,12 @@ if ($skipped) { cli_writeln('[skip] not available on this site (optional plugin 
 if (!$DB->record_exists('external_services_users', ['externalserviceid' => $svc->id, 'userid' => $user->id])) {
     $DB->insert_record('external_services_users', (object)['externalserviceid' => $svc->id, 'userid' => $user->id,
         'iprestriction' => $ip ?: null, 'validuntil' => 0, 'timecreated' => time()]);
+} else if ($ip !== '') {
+    // Re-run with --iprestriction: apply it to the existing authorisation and to the user's existing tokens too.
+    $DB->set_field('external_services_users', 'iprestriction', $ip, ['externalserviceid' => $svc->id, 'userid' => $user->id]);
+    $n = $DB->count_records('external_tokens', ['externalserviceid' => $svc->id, 'userid' => $user->id]);
+    $DB->set_field('external_tokens', 'iprestriction', $ip, ['externalserviceid' => $svc->id, 'userid' => $user->id]);
+    cli_writeln("[ok] IP restriction updated on existing authorisation and $n existing token(s)");
 }
 cli_writeln("[ok] $username authorised for $svcshort" . ($ip ? " (IP restriction $ip)" : ''));
 

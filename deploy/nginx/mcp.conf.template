@@ -1,6 +1,8 @@
-# nginx vhost for the Moodle MCP server. Replace ${MCP_DOMAIN} (e.g. mcp.example.com) and ${MCP_PORT} (default 8791),
-# e.g.:  MCP_DOMAIN=mcp.example.com MCP_PORT=8791 envsubst '${MCP_DOMAIN} ${MCP_PORT}' < mcp.conf.template > /etc/nginx/sites-available/mcp.conf
-# Then: ln -s ../sites-available/mcp.conf /etc/nginx/sites-enabled/ && certbot --nginx -d ${MCP_DOMAIN} && nginx -t && systemctl reload nginx
+# nginx vhost for the Moodle MCP server. Variables: ${MCP_DOMAIN} (e.g. mcp.example.com), ${MCP_PORT} (default 8791),
+# ${MCP_TLS_CERT} / ${MCP_TLS_KEY} (Let's Encrypt: /etc/letsencrypt/live/<domain>/fullchain.pem and privkey.pem).
+# The certificate must exist BEFORE this file is enabled (nginx -t refuses a "listen ssl" block without one).
+# See INSTALL.md step 4 for the full order. Works on nginx 1.18+ (Ubuntu 22.04/24.04 packages).
+#   envsubst '${MCP_DOMAIN} ${MCP_PORT} ${MCP_TLS_CERT} ${MCP_TLS_KEY}' < mcp.conf.template > /etc/nginx/sites-available/mcp.conf
 server {
   listen 80; listen [::]:80;
   server_name ${MCP_DOMAIN};
@@ -8,14 +10,18 @@ server {
   location / { return 301 https://$host$request_uri; }
 }
 server {
-  listen 443 ssl; listen [::]:443 ssl; http2 on;
+  # "listen ... ssl http2" instead of "http2 on;": the latter needs nginx >= 1.25.1 (Ubuntu 24.04 ships 1.24).
+  listen 443 ssl http2; listen [::]:443 ssl http2;
   server_name ${MCP_DOMAIN};
-  # ssl_certificate / ssl_certificate_key: added by certbot (or your Cloudflare origin cert)
+  ssl_certificate     ${MCP_TLS_CERT};
+  ssl_certificate_key ${MCP_TLS_KEY};
   client_max_body_size 64M;            # create_resource / create_h5pactivity uploads
   access_log /var/log/nginx/mcp.access.log;
   error_log  /var/log/nginx/mcp.error.log;
 
   # Optional IP allowlist (recommended): only your agent's egress IPs / Cloudflare ranges.
+  # Uncomment both lines; anything not allowed gets HTTP 403 (also /health, so add 127.0.0.1 for local checks).
+  # allow 127.0.0.1;
   # allow 203.0.113.0/24;
   # deny all;
 

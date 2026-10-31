@@ -1,0 +1,13 @@
+# Optional, site-specific additions. Copy to docker-compose.override.yml (git-ignored); `docker compose up -d`
+# picks it up automatically. Use only the parts you need.
+services:
+  moodle-mcp:
+    # (a) Moodle's hostname does not resolve (or hairpin-NAT fails) from inside the container, e.g. Moodle runs
+    #     on the same host behind NAT, or the name only exists in /etc/hosts. Point it at the Docker host:
+    extra_hosts:
+      - "moodle.example.com:host-gateway"
+    # (b) Moodle uses a certificate from a private/internal CA (not Let's Encrypt or another public CA):
+    environment:
+      SSL_CERT_FILE: /etc/ssl/private-ca.crt
+    volumes:
+      - /usr/local/share/ca-certificates/my-ca.crt:/etc/ssl/private-ca.crt:ro
