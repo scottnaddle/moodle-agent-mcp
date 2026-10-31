@@ -1,19 +1,35 @@
 <?php
-// Grok Bot MCP — Moodle web service setup (idempotent CLI script).
+// UbionAI — Moodle web service setup (idempotent CLI script).
 // Usage (from the Moodle dirroot, i.e. where config.php lives):
 //   sudo -u www-data php /path/to/setup_ubionai_ws.php [--username=svc_ubionai] [--email=svc_ubionai@example.invalid]
-//        [--service=ubionai] [--role=ubionai_service] [--iprestriction=203.0.113.10] [--token-file=/root/ubionai.token]
-//        [--moodle=/var/www/moodle] [--no-token]
+//        [--service=ubionai] [--role=ubionai_service] [--iprestriction=203.0.113.10]
+//        --token-file=/root/ubionai.token [--moodle=/var/www/moodle]
+//        [--no-token]
 // What it does: enables web services + REST, creates a dedicated manual-auth user, a system role
 // (manager archetype capabilities + webservice/rest:use), a restricted external service with the
 // functions the MCP server needs (optional mod_attendance_* skipped when the plugin is absent),
 // authorises the user and issues a permanent token. The token is written to --token-file (mode 600)
-// and never printed unless no file is given.
+// and is never printed. --token-file is required unless --no-token is given.
 
 define('CLI_SCRIPT', true);
 $opts = [];
 foreach (array_slice($argv, 1) as $a) {
     if (preg_match('/^--([a-z-]+)(?:=(.*))?$/', $a, $m)) { $opts[$m[1]] = $m[2] ?? true; }
+}
+if (array_key_exists('token-file', $opts)
+        && (!is_string($opts['token-file']) || trim($opts['token-file']) === '')) {
+    fwrite(STDERR, "--token-file requires a non-empty path value\n");
+    exit(2);
+}
+if (empty($opts['no-token']) && !array_key_exists('token-file', $opts)) {
+    fwrite(STDERR, "--token-file is required (or pass --no-token)\n");
+    exit(2);
+}
+if (empty($opts['no-token'])) {
+    $tokenfile = $opts['token-file'];
+    if (is_link($tokenfile)) { fwrite(STDERR, "refusing to write token to a symlink: $tokenfile\n"); exit(2); }
+    $dir = dirname($tokenfile);
+    if (!is_dir($dir) || !is_writable($dir)) { fwrite(STDERR, "token file directory not writable: $dir\n"); exit(2); }
 }
 $dirroot = $opts['moodle'] ?? getcwd();
 $cfgfile = file_exists("$dirroot/config.php") ? "$dirroot/config.php" : null;
@@ -50,7 +66,7 @@ if (!get_config('local_ubionai', 'version')) {
 $user = $DB->get_record('user', ['username' => $username, 'mnethostid' => $CFG->mnet_localhost_id]);
 if (!$user) {
     $u = (object)['username' => $username, 'auth' => 'manual', 'confirmed' => 1, 'mnethostid' => $CFG->mnet_localhost_id,
-        'firstname' => 'Grok', 'lastname' => 'Bot (service)', 'email' => $email,
+        'firstname' => 'UbionAI', 'lastname' => 'Bot (service)', 'email' => $email,
         'password' => random_string(24) . 'Aa1!', 'policyagreed' => 1];
     $uid = user_create_user($u, true, false);
     $user = $DB->get_record('user', ['id' => $uid]);
@@ -62,7 +78,7 @@ if (!$user) {
 // 4. Role (manager archetype caps + REST use), assigned at system context.
 $roleid = $DB->get_field('role', 'id', ['shortname' => $roleshort]);
 if (!$roleid) {
-    $roleid = create_role('Grok Bot service', $roleshort, 'Web service role for the Grok Bot MCP server', 'manager');
+    $roleid = create_role('UbionAI service', $roleshort, 'Web service role for the UbionAI MCP server', 'manager');
     foreach (get_default_capabilities('manager') as $cap => $perm) { assign_capability($cap, $perm, $roleid, $sys->id, true); }
     set_role_contextlevels($roleid, [CONTEXT_SYSTEM]);
     cli_writeln("[ok] created role $roleshort (id $roleid) from manager archetype");
@@ -135,14 +151,35 @@ cli_writeln("[ok] $username authorised for $svcshort" . ($ip ? " (IP restriction
 
 // 7. Token.
 if (empty($opts['no-token'])) {
+    // Remove older tokens issued by this script so tokens do not accumulate.
+    $tokconditions = ['externalserviceid' => (int) $svc->id, 'userid' => (int) $user->id, 'name' => 'ubionai-mcp'];
+    $oldtokens = $DB->count_records('external_tokens', $tokconditions);
+    if ($oldtokens) { $DB->delete_records('external_tokens', $tokconditions); }
+    cli_writeln("[ok] removed $oldtokens previous ubionai-mcp token(s)");
+
     $tok = \core_external\util::generate_token(EXTERNAL_TOKEN_PERMANENT, \core_external\util::get_service_by_id($svc->id),
         $user->id, $sys, 0, $ip ?: '', 'ubionai-mcp');
-    if ($tokenfile) {
-        $old = umask(0077); file_put_contents($tokenfile, $tok . "\n"); umask($old); chmod($tokenfile, 0600);
-        cli_writeln("[ok] token issued and written to $tokenfile (mode 600)");
-    } else {
-        cli_writeln('[ok] token issued (no --token-file given, printing once):');
-        cli_writeln($tok);
+    $tokenid = $DB->get_field('external_tokens', 'id', $tokconditions);
+
+    // Write through a 0600 temp file in the same directory, then rename over the target so the
+    // token is never written into an existing file that may have loose permissions.
+    $tmpfile = @tempnam($dir, '.ubionai-token-');
+    $written = false;
+    if ($tmpfile !== false) {
+        $written = @chmod($tmpfile, 0600);
+        if ($written) { $written = @file_put_contents($tmpfile, $tok . "\n") !== false; }
+        if ($written && (fileperms($tmpfile) & 0777) === 0600) {
+            $written = @rename($tmpfile, $tokenfile);
+        } else {
+            $written = false;
+        }
     }
+    if (!$written) {
+        if ($tmpfile !== false && file_exists($tmpfile)) { @unlink($tmpfile); }
+        if ($tokenid) { $DB->delete_records('external_tokens', ['id' => $tokenid]); }
+        fwrite(STDERR, "failed to write token file securely: $tokenfile\n");
+        exit(2);
+    }
+    cli_writeln("[ok] token issued and written to $tokenfile (mode 600)");
 }
 cli_writeln('Done.');
