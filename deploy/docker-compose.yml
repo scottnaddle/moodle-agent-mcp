@@ -1,0 +1,9 @@
+services:
+  moodle-mcp:
+    image: moodle-mcp:p0
+    container_name: moodle-mcp
+    env_file: .env
+    ports:
+      - "127.0.0.1:8791:8791"
+    mem_limit: 256m
+    restart: unless-stopped
