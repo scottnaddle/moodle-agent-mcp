@@ -80,6 +80,11 @@ def create_mcp(client: MoodleClient) -> FastMCP:
         return await call("mod_assign_get_submissions", assignmentids=assignment_ids, status=status)
 
     @mcp.tool()
+    async def get_assignment_grades(assignment_ids: list[int]) -> dict[str, Any]:
+        """Get grades already given for assignments (mod_assign_get_grades)."""
+        return await call("mod_assign_get_grades", assignmentids=assignment_ids)
+
+    @mcp.tool()
     async def gradebook_overview(course_id: int, user_id: int | None = None) -> dict[str, Any]:
         """Get gradebook items and grades for a course, optionally for a single user."""
         return await call("gradereport_user_get_grade_items", courseid=course_id, userid=user_id)

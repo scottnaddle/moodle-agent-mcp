@@ -44,6 +44,7 @@ CASES = [
         "mod_assign_get_submissions",
         {"assignmentids[0]": "9", "status": "submitted"},
     ),
+    ("get_assignment_grades", {"assignment_ids": [9]}, "mod_assign_get_grades", {"assignmentids[0]": "9"}),
     ("gradebook_overview", {"course_id": 5}, "gradereport_user_get_grade_items", {"courseid": "5"}),
     (
         "gradebook_overview",
@@ -162,7 +163,7 @@ async def test_write_tools_are_marked(mcp):
     tools = {t.name: t for t in await mcp.list_tools()}
     assert set(tools) == {
         "site_info", "list_courses", "get_course_outline", "list_students", "list_assignments",
-        "get_submissions", "gradebook_overview", "list_quizzes", "list_quiz_attempts", "review_attempt",
+        "get_submissions", "get_assignment_grades", "gradebook_overview", "list_quizzes", "list_quiz_attempts", "review_attempt",
         "attendance_sessions", "grade_submission", "bulk_grade",
     }  # fmt: skip
     for name in ("grade_submission", "bulk_grade"):
