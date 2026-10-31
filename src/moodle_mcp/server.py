@@ -2,24 +2,77 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hmac
 import html
+import ipaddress
 import json
 import logging
 import os
 import re
+import secrets
+import socket
+import threading
+import time
+from contextvars import ContextVar
 from typing import Any, Literal
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from .crypto import DecryptError, Kek, KekError, load_kek
 from .moodle import MoodleClient, MoodleError
+from .pseudonym import Pseudonymizer
+from .registry import DuplicateSite, Registry, TenantError, normalize_moodle_url, ws_endpoint
 
 logger = logging.getLogger(__name__)
+
+_current_client: ContextVar[MoodleClient | None] = ContextVar("moodle_mcp_client", default=None)
+_current_pseudonymizer: ContextVar[Pseudonymizer | None] = ContextVar(
+    "moodle_mcp_pseudonymizer", default=None
+)
+
+
+class BodyTooLarge(Exception):
+    """Raised when a request body exceeds its configured limit."""
+
+
+class _PseudonymizerStore:
+    """Process-local, per-tenant placeholder mappings used across requests."""
+
+    def __init__(self, ttl_seconds: int = 3600, max_entries: int = 512) -> None:
+        self._ttl = ttl_seconds
+        self._max_entries = max_entries
+        self._items: dict[str, tuple[Pseudonymizer, float]] = {}
+        self._lock = threading.Lock()
+
+    def get(self, site_id: str, enabled: bool = True) -> Pseudonymizer | None:
+        if not enabled:
+            return None
+        now = time.monotonic()
+        with self._lock:
+            for key, (_, seen) in list(self._items.items()):
+                if now - seen > self._ttl:
+                    del self._items[key]
+            item = self._items.get(site_id)
+            if item is not None:
+                self._items[site_id] = (item[0], now)
+                return item[0]
+            if len(self._items) >= self._max_entries:
+                oldest = min(self._items, key=lambda key: self._items[key][1])
+                del self._items[oldest]
+            pseudonymizer = Pseudonymizer()
+            self._items[site_id] = (pseudonymizer, now)
+            return pseudonymizer
+TENANT_PATH_RE = re.compile(r"^/t/([a-z0-9][a-z0-9-]{1,62})/mcp/?$")
+CHAT_PATH_RE = re.compile(r"^/t/([a-z0-9][a-z0-9-]{1,62})/v1/chat/completions/?$")
+MAX_REGISTER_BYTES = 16_384
+MAX_CHAT_BYTES = 1024 * 1024
 
 OPTIONAL_HINT = (
     "This tool needs the optional Moodle plugin {plugin}. If it is not installed (or its web service functions "
@@ -126,22 +179,66 @@ def _availability(required_cmids: list[int], open_from: int | None) -> str:
     return json.dumps({"op": "&", "c": conditions, "showc": [True] * len(conditions)})
 
 
-async def _download(url: str, limit: int = MAX_UPLOAD_BYTES) -> bytes:
-    if not url.lower().startswith(("http://", "https://")):
+def _blocked_ip(address: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(address.split("%", 1)[0])
+    except ValueError:
+        return True
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return not ip.is_global or ip.is_private or ip.is_loopback or ip.is_link_local
+
+
+def _resolve_host(host: str, port: int) -> list[tuple[Any, ...]]:
+    """DNS indirection point so tests can avoid touching the network."""
+    return socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+
+
+async def _assert_public_url(url: str, resolver: Any = None) -> None:
+    parts = urlsplit(url)
+    if parts.scheme.lower() not in ("http", "https") or not parts.hostname:
         raise ValueError("file_url must be an http(s) URL")
+    if parts.username is not None or parts.password is not None:
+        raise ValueError("file_url must not contain credentials")
+    try:
+        port = parts.port or (443 if parts.scheme.lower() == "https" else 80)
+    except ValueError:
+        raise ValueError("file_url must be an http(s) URL") from None
+    try:
+        infos = await asyncio.to_thread(
+            resolver or _resolve_host, parts.hostname, port
+        )
+    except socket.gaierror:
+        return
+    for info in infos:
+        if _blocked_ip(info[4][0]):
+            raise ValueError("file_url host is not allowed")
+
+
+async def _download(url: str, limit: int = MAX_UPLOAD_BYTES, resolver: Any = None) -> bytes:
     timeout = httpx.Timeout(120.0, connect=10.0)
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        async with client.stream("GET", url) as resp:
-            resp.raise_for_status()
-            if int(resp.headers.get("content-length") or 0) > limit:
-                raise ValueError(f"file is larger than {limit} bytes")
-            chunks, size = [], 0
-            async for chunk in resp.aiter_bytes():
-                size += len(chunk)
-                if size > limit:
+    current = url
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+        for _ in range(6):
+            await _assert_public_url(current, resolver)
+            async with client.stream("GET", current) as resp:
+                if resp.status_code in (301, 302, 303, 307, 308):
+                    location = resp.headers.get("location")
+                    if not location:
+                        raise ValueError("file_url redirect has no location")
+                    current = urljoin(str(resp.url), location)
+                    continue
+                resp.raise_for_status()
+                if int(resp.headers.get("content-length") or 0) > limit:
                     raise ValueError(f"file is larger than {limit} bytes")
-                chunks.append(chunk)
-    return b"".join(chunks)
+                chunks, size = [], 0
+                async for chunk in resp.aiter_bytes():
+                    size += len(chunk)
+                    if size > limit:
+                        raise ValueError(f"file is larger than {limit} bytes")
+                    chunks.append(chunk)
+                return b"".join(chunks)
+    raise ValueError("file_url redirected too many times")
 
 
 def _check_file(filename: str, file_url: str | None, file_base64: str | None) -> tuple[bytes | None, str | None]:
@@ -165,7 +262,18 @@ def _wrap(result: Any, key: str = "result") -> dict[str, Any]:
     return result if isinstance(result, dict) else {key: result}
 
 
-def create_mcp(client: MoodleClient) -> FastMCP:
+def _map_strings(value: Any, transform: Any) -> Any:
+    """Recursively apply transform to every string value (keys are untouched)."""
+    if isinstance(value, str):
+        return transform(value)
+    if isinstance(value, list):
+        return [_map_strings(item, transform) for item in value]
+    if isinstance(value, dict):
+        return {key: _map_strings(item, transform) for key, item in value.items()}
+    return value
+
+
+def create_mcp(client: MoodleClient | None) -> FastMCP:
     mcp = FastMCP(
         "moodle",
         instructions=(
@@ -179,11 +287,44 @@ def create_mcp(client: MoodleClient) -> FastMCP:
         json_response=True,
     )
 
-    async def call(wsfunction: str, key: str = "result", **params: Any) -> dict[str, Any]:
+    def _request_client() -> MoodleClient | None:
         try:
-            return _wrap(await client.call(wsfunction, **params), key)
+            ctx = mcp.get_context()
+            request = ctx.request_context.request
+            if request is not None:
+                scoped = request.scope.get("state", {}).get("moodle_client")
+                if scoped is not None:
+                    return scoped
+        except (LookupError, ValueError, AttributeError, KeyError):
+            pass
+        return _current_client.get()
+
+    def _request_pseudonymizer() -> Pseudonymizer | None:
+        try:
+            ctx = mcp.get_context()
+            request = ctx.request_context.request
+            if request is not None:
+                scoped = request.scope.get("state", {}).get("pseudonymizer")
+                if scoped is not None:
+                    return scoped
+        except (LookupError, ValueError, AttributeError, KeyError):
+            pass
+        return _current_pseudonymizer.get()
+
+    async def call(wsfunction: str, key: str = "result", **params: Any) -> dict[str, Any]:
+        active = client or _request_client()
+        if active is None:
+            raise MoodleError("no tenant context")
+        pseudonymizer = _request_pseudonymizer()
+        if pseudonymizer is not None:
+            params = pseudonymizer.restore_value(params)
+        try:
+            result = _wrap(await active.call(wsfunction, **params), key)
         except MoodleError as exc:
-            return {"error": str(exc)}
+            result = {"error": str(exc)}
+        if pseudonymizer is not None:
+            result = pseudonymizer.pseudonymize_value(result)
+        return result
 
     @mcp.tool()
     async def site_info() -> dict[str, Any]:
@@ -1006,7 +1147,7 @@ class BearerAuthMiddleware:
                 await send({"type": "websocket.close", "code": 1008})
             return
 
-        if scope["path"] == "/health" and scope["method"] in ("GET", "HEAD"):
+        if scope["path"] in ("/health", "/healthz") and scope["method"] in ("GET", "HEAD"):
             await _json(send, 200, {"status": "ok"})
             return
 
@@ -1028,20 +1169,459 @@ async def _json(send: Send, status: int, body: dict[str, Any], extra: list[tuple
     await send({"type": "http.response.body", "body": payload})
 
 
+def _bearer_from_scope(scope: Scope) -> str | None:
+    provided: bytes | None = None
+    for name, value in scope.get("headers", []):
+        if name.lower() == b"authorization":
+            provided = value
+            break
+    if provided is None:
+        return None
+    try:
+        text = provided.decode("latin-1")
+    except UnicodeDecodeError:  # pragma: no cover - latin-1 never fails
+        return None
+    scheme, separator, token = text.partition(" ")
+    if scheme != "Bearer" or not separator or not token:
+        return None
+    if token.strip() != token or any(char.isspace() for char in token):
+        return None
+    return token
+
+
+async def _read_body(receive: Receive, limit: int | None = None) -> bytes:
+    chunks: list[bytes] = []
+    size = 0
+    while True:
+        message = await receive()
+        if message["type"] == "http.disconnect":
+            break
+        if message["type"] != "http.request":
+            continue
+        chunk = message.get("body", b"")
+        size += len(chunk)
+        if limit is not None and size > limit:
+            raise BodyTooLarge
+        chunks.append(chunk)
+        if not message.get("more_body", False):
+            break
+    return b"".join(chunks)
+
+
+async def _handle_register(
+    scope: Scope,
+    receive: Receive,
+    send: Send,
+    registry: Registry,
+    public_url: str,
+    egress_ip: str | None,
+) -> None:
+    if scope.get("method") != "POST":
+        await _json(send, 404, {"error": "not found"})
+        return
+
+    headers = {name.lower(): value for name, value in scope.get("headers", [])}
+    content_type = headers.get(b"content-type", b"").split(b";", 1)[0].strip().lower()
+    if content_type != b"application/json":
+        await _json(send, 415, {"error": "unsupported media type"})
+        return
+    try:
+        content_length = int(headers.get(b"content-length", b"0"))
+    except ValueError:
+        content_length = 0
+    if content_length > MAX_REGISTER_BYTES:
+        await _json(send, 413, {"error": "request too large"})
+        return
+
+    try:
+        body = await _read_body(receive, MAX_REGISTER_BYTES)
+    except BodyTooLarge:
+        await _json(send, 413, {"error": "request too large"})
+        return
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        await _json(send, 400, {"error": "invalid request"})
+        return
+    required = {"registration_code", "site_url", "wstoken"}
+    if not isinstance(payload, dict) or set(payload) != required:
+        await _json(send, 400, {"error": "invalid request"})
+        return
+    code = payload["registration_code"]
+    site_url = payload["site_url"]
+    wstoken = payload["wstoken"]
+    if not all(isinstance(value, str) and value for value in (code, site_url, wstoken)):
+        await _json(send, 400, {"error": "invalid request"})
+        return
+
+    claimed = registry.lookup_code(code, int(time.time()))
+    if claimed is None:
+        await _json(send, 403, {"error": "forbidden"})
+        return
+    site_id, bound_url = claimed
+    allow_http = os.environ.get("UBIONAI_HUB_ALLOW_HTTP") == "1"
+    try:
+        normalized = normalize_moodle_url(site_url, allow_http)
+    except TenantError:
+        await _json(send, 403, {"error": "forbidden"})
+        return
+    if normalized != bound_url:
+        await _json(send, 403, {"error": "forbidden"})
+        return
+    if registry.get(site_id) is not None:
+        await _json(send, 409, {"error": "conflict"})
+        return
+
+    try:
+        info = await MoodleClient(ws_endpoint(bound_url), wstoken).call("core_webservice_get_site_info")
+    except MoodleError:
+        await _json(send, 400, {"error": "registration failed"})
+        return
+    siteurl = info.get("siteurl") if isinstance(info, dict) else None
+    try:
+        if not isinstance(siteurl, str) or normalize_moodle_url(siteurl, allow_http) != bound_url:
+            await _json(send, 400, {"error": "registration failed"})
+            return
+    except TenantError:
+        await _json(send, 400, {"error": "registration failed"})
+        return
+
+    bearer = secrets.token_urlsafe(32)
+    try:
+        registry.add(site_id, bound_url, wstoken.encode(), None, bearer)
+    except DuplicateSite:
+        await _json(send, 409, {"error": "conflict"})
+        return
+    except TenantError:
+        await _json(send, 400, {"error": "registration failed"})
+        return
+
+    if not registry.consume_code(code, int(time.time())):
+        try:
+            registry.delete(site_id)
+        except TenantError:
+            pass
+        await _json(send, 403, {"error": "forbidden"})
+        return
+
+    await _json(
+        send,
+        200,
+        {
+            "site_id": site_id,
+            "mcp_endpoint": f"{public_url}/t/{site_id}/mcp",
+            "mcp_bearer": bearer,
+            "egress_ip": egress_ip,
+        },
+    )
+
+
+def _pseudonymize_content(content: Any, pseudonymizer: Pseudonymizer) -> Any:
+    if isinstance(content, str):
+        return pseudonymizer.pseudonymize(content)
+    parts = []
+    for part in content:
+        if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
+            part = {**part, "text": pseudonymizer.pseudonymize(part["text"])}
+        parts.append(part)
+    return parts
+
+
+def _valid_chat_messages(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return False
+    for message in messages:
+        if not isinstance(message, dict) or not isinstance(message.get("role"), str):
+            return False
+        content = message.get("content")
+        if isinstance(content, str):
+            continue
+        if content is None and isinstance(message.get("tool_calls"), list):
+            continue
+        if not isinstance(content, list):
+            return False
+        for part in content:
+            if (
+                not isinstance(part, dict)
+                or part.get("type") != "text"
+                or not isinstance(part.get("text"), str)
+            ):
+                return False
+    return True
+
+
+async def _handle_chat_proxy(
+    scope: Scope,
+    receive: Receive,
+    send: Send,
+    registry: Registry,
+    tenant: Any,
+    pseudonymizer: Pseudonymizer | None,
+) -> None:
+    if scope.get("method") != "POST":
+        await _json(send, 404, {"error": "not found"})
+        return
+
+    headers = {name.lower(): value for name, value in scope.get("headers", [])}
+    try:
+        content_length = int(headers.get(b"content-length", b"0"))
+    except ValueError:
+        content_length = 0
+    if content_length > MAX_CHAT_BYTES:
+        await _json(send, 413, {"error": "request too large"})
+        return
+
+    try:
+        body = await _read_body(receive, MAX_CHAT_BYTES)
+    except BodyTooLarge:
+        await _json(send, 413, {"error": "request too large"})
+        return
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        await _json(send, 400, {"error": "invalid request"})
+        return
+    if not _valid_chat_messages(payload):
+        await _json(send, 400, {"error": "invalid request"})
+        return
+
+    key_buf: bytearray | None = None
+    try:
+        try:
+            key_buf = registry.litellm_key(tenant)
+        except DecryptError:
+            logger.error("decrypt failed site=%s", tenant.site_id)
+            await _json(send, 500, {"error": "internal error"})
+            return
+        if key_buf is None:
+            await _json(send, 403, {"error": "forbidden"})
+            return
+
+        if pseudonymizer is not None:
+            payload = pseudonymizer.pseudonymize_chat_payload(payload)
+        if payload.get("stream") is True:
+            payload["stream"] = False
+
+        base_url = (os.environ.get("UBIONAI_HUB_LITELLM_URL") or "http://litellm:4000").rstrip("/")
+        try:
+            key = bytes(key_buf).decode()
+            async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0)) as http:
+                upstream = await http.post(
+                    base_url + "/v1/chat/completions",
+                    json=payload,
+                    headers={"Authorization": f"Bearer {key}"},
+                )
+        except (httpx.HTTPError, UnicodeDecodeError):
+            await _json(send, 502, {"error": "upstream error"})
+            return
+
+        try:
+            data = upstream.json()
+        except ValueError:
+            text = upstream.text
+            if pseudonymizer is not None:
+                text = pseudonymizer.restore(text)
+            await _send_raw(send, upstream.status_code, text.encode(), b"text/plain")
+            return
+        if pseudonymizer is not None:
+            data = pseudonymizer.restore_value(data)
+        await _json(send, upstream.status_code, data)
+    finally:
+        if key_buf is not None:
+            key_buf[:] = b"\x00" * len(key_buf)
+
+
+async def _send_raw(send: Send, status: int, payload: bytes, content_type: bytes) -> None:
+    headers = [(b"content-type", content_type), (b"content-length", str(len(payload)).encode())]
+    await send({"type": "http.response.start", "status": status, "headers": headers})
+    await send({"type": "http.response.body", "body": payload})
+
+
+class RegisterEndpoint:
+    """ASGI wrapper that serves POST /register in multi-tenant mode."""
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        registry: Registry,
+        kek: Kek,
+        public_url: str,
+        egress_ip: str | None,
+    ) -> None:
+        self.app = app
+        self.registry = registry
+        self.kek = kek
+        self.public_url = public_url
+        self.egress_ip = egress_ip
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "lifespan":
+            await self.app(scope, receive, send)
+            return
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        if scope.get("path") == "/register":
+            await _handle_register(
+                scope, receive, send, self.registry, self.public_url, self.egress_ip
+            )
+            return
+        await self.app(scope, receive, send)
+
+
+class TenantRouterMiddleware:
+    """Authenticate a tenant, then route /t/<site_id>/mcp to the MCP app."""
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        registry: Registry,
+        pseudonymizers: _PseudonymizerStore | None = None,
+    ) -> None:
+        self.app = app
+        self.registry = registry
+        self.pseudonymizers = pseudonymizers or _PseudonymizerStore()
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "lifespan":
+            await self.app(scope, receive, send)
+            return
+        if scope["type"] != "http":
+            if scope["type"] == "websocket":
+                await send({"type": "websocket.close", "code": 1008})
+            return
+
+        path = scope.get("path", "")
+        method = scope.get("method", "")
+        if path in ("/health", "/healthz") and method in ("GET", "HEAD"):
+            await _json(send, 200, {"status": "ok"})
+            return
+        if path == "/register":
+            await self.app(scope, receive, send)
+            return
+
+        match = TENANT_PATH_RE.fullmatch(path)
+        chat_match = CHAT_PATH_RE.fullmatch(path)
+        raw_path = scope.get("raw_path")
+        if raw_path:
+            try:
+                raw_text = raw_path.decode("latin-1")
+            except UnicodeDecodeError:  # pragma: no cover - latin-1 never fails
+                raw_text = ""
+            if TENANT_PATH_RE.fullmatch(raw_text) is None:
+                match = None
+            if CHAT_PATH_RE.fullmatch(raw_text) is None:
+                chat_match = None
+        if match is None and chat_match is None:
+            await _json(send, 404, {"error": "not found"})
+            return
+
+        if chat_match is not None:
+            site_id = chat_match.group(1)
+            bearer = _bearer_from_scope(scope)
+            verified = (
+                self.registry.verify_bearer(site_id, bearer)
+                if bearer is not None
+                else None
+            )
+            if verified is None or verified.litellm_ct is None:
+                await _json(send, 403, {"error": "forbidden"})
+                return
+            pseudonymizer = self.pseudonymizers.get(site_id, verified.pseudonymize)
+            await _handle_chat_proxy(
+                scope, receive, send, self.registry, verified, pseudonymizer
+            )
+            return
+
+        site_id = match.group(1)
+
+        bearer = _bearer_from_scope(scope)
+        if bearer is None:
+            await _json(send, 401, {"error": "unauthorized"}, [(b"www-authenticate", b"Bearer")])
+            return
+        tenant = self.registry.verify_bearer(site_id, bearer)
+        if tenant is None:
+            await _json(send, 403, {"error": "forbidden"})
+            return
+
+        token_buf: bytearray | None = None
+        try:
+            try:
+                token_buf = self.registry.moodle_token(tenant)
+            except DecryptError:
+                logger.error("decrypt failed site=%s", site_id)
+                await _json(send, 500, {"error": "internal error"})
+                return
+            client = MoodleClient(ws_endpoint(tenant.moodle_url), token_buf)
+            pseudonymizer = self.pseudonymizers.get(site_id, tenant.pseudonymize)
+            state = scope.setdefault("state", {})
+            state["moodle_client"] = client
+            state["pseudonymizer"] = pseudonymizer
+            scope["path"] = "/mcp"
+            scope["raw_path"] = b"/mcp"
+            context_token = _current_client.set(client)
+            pseudonymizer_token = _current_pseudonymizer.set(pseudonymizer)
+            try:
+                await self.app(scope, receive, send)
+            finally:
+                _current_pseudonymizer.reset(pseudonymizer_token)
+                _current_client.reset(context_token)
+        finally:
+            if token_buf is not None:
+                token_buf[:] = b"\x00" * len(token_buf)
+
+
 def create_app(
     *,
     moodle_endpoint: str | None = None,
     moodle_token: str | None = None,
     bearer_token: str | None = None,
+    hub_db: str | None = None,
+    kek_file: str | None = None,
 ) -> ASGIApp:
-    """Build the full ASGI app (auth middleware + MCP). Values default to env vars."""
-    endpoint = moodle_endpoint if moodle_endpoint is not None else os.environ.get("MOODLE_WS_ENDPOINT", "")
-    token = moodle_token if moodle_token is not None else os.environ.get("MOODLE_TOKEN", "")
-    bearer = bearer_token if bearer_token is not None else os.environ.get("MCP_BEARER_TOKEN", "")
-    if not bearer.strip():
-        raise RuntimeError("MCP_BEARER_TOKEN is empty; refusing to start")
-    if not endpoint or not token:
-        logger.warning("MOODLE_WS_ENDPOINT or MOODLE_TOKEN not set; tool calls will return errors")
+    """Build the full ASGI app. Values default to env vars."""
+    db_path = hub_db if hub_db is not None else os.environ.get("UBIONAI_HUB_DB", "")
+    if not db_path:
+        endpoint = moodle_endpoint if moodle_endpoint is not None else os.environ.get("MOODLE_WS_ENDPOINT", "")
+        token = moodle_token if moodle_token is not None else os.environ.get("MOODLE_TOKEN", "")
+        bearer = bearer_token if bearer_token is not None else os.environ.get("MCP_BEARER_TOKEN", "")
+        if not bearer.strip():
+            raise RuntimeError("MCP_BEARER_TOKEN is empty; refusing to start")
+        if not endpoint or not token:
+            logger.warning("MOODLE_WS_ENDPOINT or MOODLE_TOKEN not set; tool calls will return errors")
 
-    mcp = create_mcp(MoodleClient(endpoint, token))
-    return BearerAuthMiddleware(mcp.streamable_http_app(), bearer.strip())
+        mcp = create_mcp(MoodleClient(endpoint, token))
+        return BearerAuthMiddleware(mcp.streamable_http_app(), bearer.strip())
+
+    kek_path = kek_file if kek_file is not None else os.environ.get("UBIONAI_HUB_KEK_FILE", "")
+    if not kek_path:
+        raise RuntimeError("KEK file invalid")
+    try:
+        kek = load_kek(kek_path)
+    except KekError:
+        raise RuntimeError("KEK file invalid") from None
+
+    registry = Registry.open(db_path, kek)
+    kek_ids = registry.kek_ids()
+    if kek_ids and kek.kek_id not in kek_ids:
+        raise RuntimeError("KEK file invalid")
+
+    if (
+        moodle_token
+        or bearer_token
+        or os.environ.get("MOODLE_TOKEN")
+        or os.environ.get("MCP_BEARER_TOKEN")
+    ):
+        raise RuntimeError("global Moodle credentials are not allowed in multi-tenant mode")
+
+    public_url = (os.environ.get("UBIONAI_HUB_PUBLIC_URL") or "").rstrip("/")
+    egress_ip = os.environ.get("UBIONAI_HUB_EGRESS_IP") or None
+
+    mcp = create_mcp(None)
+    inner = RegisterEndpoint(
+        mcp.streamable_http_app(), registry, kek, public_url, egress_ip
+    )
+    return TenantRouterMiddleware(inner, registry)

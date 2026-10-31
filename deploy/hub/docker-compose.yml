@@ -1,0 +1,27 @@
+services:
+  hub:
+    image: moodle-mcp:${IMAGE_TAG:-latest}
+    environment:
+      UBIONAI_HUB_DB: /data/hub.sqlite3
+      UBIONAI_HUB_KEK_FILE: /run/secrets/kek.key
+      UBIONAI_HUB_PUBLIC_URL: https://hub-staging.ubion.global
+      UBIONAI_HUB_EGRESS_IP: ${UBIONAI_HUB_EGRESS_IP:-}
+      UBIONAI_HUB_LITELLM_URL: http://litellm:4000
+      MCP_PORT: 8090
+      LOG_LEVEL: INFO
+    secrets: [kek.key]
+    volumes: [hub-data:/data]
+    ports: ["127.0.0.1:8090:8090"]
+    networks: [ubionai-staging]
+    mem_limit: 512m
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+secrets:
+  kek.key: { file: /opt/ubionai-hub/secrets/kek.key }
+volumes: { hub-data: {} }
+networks:
+  ubionai-staging:
+    external: true

@@ -4,6 +4,7 @@ import sys
 
 import uvicorn
 
+from .crypto import KekError
 from .server import create_app
 
 
@@ -12,7 +13,7 @@ def main() -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
     try:
         app = create_app()
-    except RuntimeError as exc:
+    except (RuntimeError, KekError) as exc:
         logging.getLogger("moodle_mcp").error("%s", exc)
         sys.exit(1)
     port = int(os.environ.get("MCP_PORT") or "8791")
