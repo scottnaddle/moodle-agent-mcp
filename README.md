@@ -1,114 +1,106 @@
-# moodle-mcp
+# Moodle Agent (Grok Bot × Moodle MCP)
 
-A small [MCP](https://modelcontextprotocol.io) server that exposes Moodle REST web services as tools.
-It only reads from and writes to Moodle — content generation happens in the calling bot (Grok Bot).
+> COURSEMOS팀 공유용 리포입니다. Grok Bot이 Moodle 강좌를 읽고, 만들고, 채점까지 돕도록 만든 MCP 서버와 동반 Moodle 플러그인을 한 곳에 모았어요. 토큰·비밀값·실서버 주소는 전부 빼거나 placeholder로 바꿨습니다.
 
-- Python 3.12, official `mcp` SDK (`FastMCP`, pinned `<2`), Streamable HTTP (`stateless_http=True`, `json_response=True`)
-- Served by uvicorn at `http://0.0.0.0:$MCP_PORT/mcp` (default port `8791`)
-- Bearer-token auth on every request except `GET /health`
+## 개요
+- **`src/moodle_mcp/`** — FastMCP(Python 3.12) 기반 Streamable-HTTP MCP 서버. Moodle 도구 **39개**(읽기 14 · 쓰기 25)를 노출하고, Bearer 토큰으로 보호합니다.
+- **`plugins/local_grokbot/`** — 서버가 의존하는 Moodle 로컬 플러그인(v0.3.0, 웹서비스 함수 9개). 코어 WS에 없는 기능(모듈 생성/수정, 루브릭, 성적 카테고리, 배지 등)을 채워 줍니다.
+- **`docs/`** — 통합 설계 메모, 공유 브리프, 강좌 8 데모 정리, 강좌 설계 자료(`moodle-design/`).
+- 쓰기 도구는 전부 `confirm=false`로 미리보기 → 교사 승인 → `confirm=true`로 실행하는 2단계 방식입니다. (`grade_submission`/`bulk_grade`는 confirm 인자 없이 승인 후 호출)
 
-## Configuration
-
-| Variable             | Description                                                          |
-|----------------------|----------------------------------------------------------------------|
-| `MOODLE_WS_ENDPOINT` | REST endpoint, e.g. `https://moodle.example.com/webservice/rest/server.php` |
-| `MOODLE_TOKEN`       | Moodle web service token                                             |
-| `MCP_BEARER_TOKEN`   | Token clients must send as `Authorization: Bearer …` (**required**; server refuses to start if empty) |
-| `MCP_PORT`           | Listen port (default `8791`)                                         |
-| `LOG_LEVEL`          | Optional, default `INFO`                                             |
-
-Token values are never logged or included in error messages. See `.env.example`; never commit a real `.env`.
-
-## Tools
-
-| Tool | Moodle function |
-|------|-----------------|
-| `site_info()` | `core_webservice_get_site_info` |
-| `list_courses(ids=None)` | `core_course_get_courses` (`options[ids]`) |
-| `get_course_outline(course_id)` | `core_course_get_contents` |
-| `list_students(course_id)` | `core_enrol_get_enrolled_users` |
-| `list_assignments(course_ids=None)` | `mod_assign_get_assignments` |
-| `get_submissions(assignment_ids, status="")` | `mod_assign_get_submissions` |
-| `gradebook_overview(course_id, user_id=None)` | `gradereport_user_get_grade_items` |
-| `list_quizzes(course_ids=None)` | `mod_quiz_get_quizzes_by_courses` |
-| `list_quiz_attempts(quiz_id, user_id, status="all")` | `mod_quiz_get_user_attempts` (no previews) |
-| `review_attempt(attempt_id)` | `mod_quiz_get_attempt_review` |
-| `attendance_sessions(attendance_id)` | `mod_attendance_get_sessions` |
-| `grade_submission(...)` **WRITE** | `mod_assign_save_grade` |
-| `bulk_grade(assignment_id, grades)` **WRITE** | `mod_assign_save_grades` |
-| `get_assignment_grades(assignment_ids)` | `mod_assign_get_grades` |
-| `list_categories()` | `core_course_get_categories` |
-| `list_forum_discussions(forum_id)` | `mod_forum_get_forum_discussions` + `mod_forum_get_discussion_posts` per discussion |
-| `create_course(...)` **WRITE, preview** | `core_course_create_courses` + `enrol_manual_enrol_users` |
-| `create_assignment(course_id, section, name, ...)` **WRITE, preview** | `local_grokbot_create_module` (assign) |
-| `create_quiz(course_id, section, name, ...)` **WRITE, preview** | `local_grokbot_create_module` (quiz) |
-| `create_forum(course_id, section, name, ...)` **WRITE, preview** | `local_grokbot_create_module` (forum) |
-| `create_page(course_id, section, name, content_html, video_url=None, ...)` **WRITE, preview** | `local_grokbot_create_module` (page) |
-| `create_resource(course_id, section, name, filename, file_url \| file_base64, ...)` **WRITE, preview** | `core_files_upload` to the bot's draft area, then `local_grokbot_create_module` (resource) |
-| `update_activity(cmid, name, intro, visible, settings)` **WRITE, preview** | `local_grokbot_update_module` |
-| `set_activity_visibility(cmid, visible)` **WRITE, preview** | `core_course_edit_module` (show/hide); returns `{ok, cmid, visible}` |
-| `set_completion(cmid, mode, posts, pass_grade)` **WRITE, preview** | `local_grokbot_update_module` |
-| `set_access_restriction(target_type, course_id, target, required_cmids, open_from)` **WRITE, preview** | `local_grokbot_update_module` / `local_grokbot_set_section_availability` |
-| `add_quiz_questions(quiz_id, questions)` **WRITE, preview** | `local_grokbot_add_quiz_questions` |
-| `add_sections(course_id, names, summaries)` **WRITE, preview** | `local_grokbot_add_sections` |
-| `update_section(course_id, section, name, summary)` **WRITE, preview** | `local_grokbot_update_section` |
-| `post_forum_discussion(forum_id, subject, message)` **WRITE, preview** | `mod_forum_add_discussion` |
-| `create_workshop(course_id, section, name, strategy, grade, gradinggrade, ...)` **WRITE, preview** | `local_grokbot_create_module` (workshop) |
-| `create_wiki(course_id, section, name, mode, first_page_title, group_mode, ...)` **WRITE, preview** | `local_grokbot_create_module` (wiki) |
-| `create_glossary(course_id, section, name, display_format, default_approval, ...)` **WRITE, preview** | `local_grokbot_create_module` (glossary) |
-| `create_feedback(course_id, section, name, anonymous, ...)` **WRITE, preview** | `local_grokbot_create_module` (feedback) |
-| `create_h5pactivity(course_id, section, name, filename, file_url \| file_base64, ...)` **WRITE, preview** | `core_files_upload`, then `local_grokbot_create_module` (h5pactivity, `packagefile`) |
-| `create_openmaic(course_id, section, name, prompt, lecture_id, completion_min_progress, ...)` **WRITE, preview** | `local_grokbot_create_module` (openmaic) |
-| `set_rubric(cmid, name, criteria, description, area)` **WRITE, preview** | `local_grokbot_set_rubric` |
-| `set_grade_categories(course_id, categories, aggregation)` **WRITE, preview** | `local_grokbot_set_grade_categories` |
-| `create_badge(course_id, name, description, activity_cmids, min_course_grade, enable)` **WRITE, preview** | `local_grokbot_create_badge` |
-
-Every tool returns a JSON object. Moodle responses are returned unchanged when they are objects. Lists and nulls are wrapped (for example `{"courses": [...]}`, `{"users": [...]}`, `{"result": null}`), and the write tools add `"ok": true`.
-Moodle errors come back as `{"error": "<wsfunction>: [errorcode] message"}`.
-WRITE tools are described as "only call after the teacher confirmed".
-Tools marked *preview* take `confirm` (default `false`): without it they return `{"preview": true, ...}`
-describing the change and make no Moodle call; with `confirm=true` they apply it.
-`local_grokbot_*` functions come from the `local_grokbot` Moodle plugin (version 0.3.0 or later).
-The new `create_*` tools accept `settings`: extra module fields passed through as is.
-`create_resource` / `create_h5pactivity` download `file_url` (http/https, max 200 MB) into memory on the MCP server and sends the
-file base64-encoded, so Moodle's `post_max_size` must allow roughly 1.4x the file size.
-
-Your Moodle web service must include all of these functions, and the token's user needs the matching capabilities.
-`mod_attendance_get_sessions` requires the Attendance plugin.
-
-## Run locally
-
-```bash
-python3.12 -m venv .venv
-.venv/bin/pip install -e ".[test]"
-export MOODLE_WS_ENDPOINT=... MOODLE_TOKEN=... MCP_BEARER_TOKEN=...
-.venv/bin/python -m moodle_mcp
-curl localhost:8791/health
+## 아키텍처
+```mermaid
+flowchart LR
+  G[Grok Bot] -- MCP stdio --> R[mcp-remote]
+  R -- "HTTPS + Bearer<br/>Streamable HTTP /mcp" --> S[Moodle MCP 서버<br/>FastMCP · Docker]
+  S -- "REST wstoken<br/>core_* / mod_*" --> M[(Moodle 5.x<br/>Web Services)]
+  S -- "REST wstoken<br/>local_grokbot_*" --> P[local_grokbot 플러그인]
+  P --- M
 ```
 
-## Docker
+## 도구 목록 (39)
+| # | 이름 | 종류 | 설명 |
+|---|---|---|---|
+| 1 | `site_info` | 읽기 | Get Moodle site info and the identity of the web service user. |
+| 2 | `list_courses` | 읽기 | List courses. |
+| 3 | `get_course_outline` | 읽기 | Get the sections and activities/modules of a course. |
+| 4 | `list_students` | 읽기 | List users enrolled in a course (with roles and groups). |
+| 5 | `list_assignments` | 읽기 | List assignments, grouped by course. |
+| 6 | `get_submissions` | 읽기 | Get submissions for assignments. |
+| 7 | `get_assignment_grades` | 읽기 | Get grades already given for assignments (mod_assign_get_grades). |
+| 8 | `gradebook_overview` | 읽기 | Get gradebook items and grades for a course, optionally for a single user. |
+| 9 | `list_quizzes` | 읽기 | List quizzes in the given courses (omit for all accessible courses). |
+| 10 | `list_quiz_attempts` | 읽기 | List a user's attempts on a quiz. |
+| 11 | `review_attempt` | 읽기 | Get the full review (questions, responses, marks) of a quiz attempt. |
+| 12 | `attendance_sessions` | 읽기 | List sessions (and attendance logs) of an attendance activity instance. |
+| 13 | `list_categories` | 읽기 | List course categories (id, name, parent, coursecount). |
+| 14 | `create_course` | 쓰기 | Create a course (core_course_create_courses) and enrol the bot as editingteacher. |
+| 15 | `grade_submission` | 쓰기 | Save a grade and feedback comment for one student's assignment submission. |
+| 16 | `bulk_grade` | 쓰기 | Save grades and feedback for several students of one assignment at once. |
+| 17 | `create_assignment` | 쓰기 | Create an assignment in a course section. |
+| 18 | `create_quiz` | 쓰기 | Create a quiz in a course section. |
+| 19 | `create_forum` | 쓰기 | Create a forum in a course section. |
+| 20 | `create_page` | 쓰기 | Create a page (HTML content) in a course section. |
+| 21 | `create_resource` | 쓰기 | Upload a file and create a file resource in a course section. |
+| 22 | `create_workshop` | 쓰기 | . |
+| 23 | `create_wiki` | 쓰기 | . |
+| 24 | `create_glossary` | 쓰기 | . |
+| 25 | `create_feedback` | 쓰기 | . |
+| 26 | `create_h5pactivity` | 쓰기 | . |
+| 27 | `create_openmaic` | 쓰기 | . |
+| 28 | `set_rubric` | 쓰기 | Define (or replace) the rubric of an activity. |
+| 29 | `set_grade_categories` | 쓰기 | Organise the gradebook into weighted categories under the course total and move activities' grade items into them. |
+| 30 | `create_badge` | 쓰기 | Create a course badge awarded when all activity_cmids are completed and/or the course is completed with at least min_course_grade. |
+| 31 | `update_activity` | 쓰기 | Update an activity (local_grokbot_update_module). |
+| 32 | `set_activity_visibility` | 쓰기 | Show or hide an activity on the course page. |
+| 33 | `set_completion` | 쓰기 | Set the completion rule of an activity. |
+| 34 | `set_access_restriction` | 쓰기 | Restrict access to an activity (target = cmid) or a section (target = section number): require completion of required_cmids and/or a start date open_from (unix timestamp). |
+| 35 | `add_quiz_questions` | 쓰기 | Create questions and add them to a quiz (quiz_id = quiz instance id, not cmid). |
+| 36 | `add_sections` | 쓰기 | Append sections to a course. |
+| 37 | `update_section` | 쓰기 | Rename a course section and/or change its summary (HTML). |
+| 38 | `post_forum_discussion` | 쓰기 | Post a new discussion to a forum (forum_id = forum instance id). |
+| 39 | `list_forum_discussions` | 읽기 | List the discussions of a forum (forum instance id) with all their posts. |
 
+## 설치 / 배포
+### 1. Moodle 쪽 준비
+1. `plugins/local_grokbot`을 Moodle의 `local/grokbot`에 복사 → 관리자 화면에서 업그레이드(알림) 실행.
+2. 사이트 관리 → 고급 기능 → **웹 서비스 활성화**, 관리 → 플러그인 → 웹 서비스 → **REST 프로토콜 활성화**.
+3. 전용 서비스 사용자(예: `svc_grokbot`) 생성. admin 계정 토큰은 쓰지 마세요.
+4. 외부 서비스 생성(읽기용/쓰기용 분리 권장) → 필요한 `core_*`, `mod_*`, `local_grokbot_*` 함수 추가 → 허가된 사용자에 서비스 사용자 등록.
+5. 서비스 사용자에 맞는 역할/권한 부여 후 **토큰 발급**(관리 → 웹 서비스 → 토큰 관리).
+
+### 2. MCP 서버 실행 (docker compose)
 ```bash
-docker build -t moodle-mcp .
-docker run --rm -p 8791:8791 --memory 256m \
-  -e MOODLE_WS_ENDPOINT -e MOODLE_TOKEN -e MCP_BEARER_TOKEN moodle-mcp
+cp .env.example .env      # 값 채우기 (커밋 금지)
+#  MOODLE_WS_ENDPOINT=https://moodle.example.com/webservice/rest/server.php
+#  MOODLE_TOKEN=<서비스 사용자 토큰>
+#  MCP_BEARER_TOKEN=<길고 랜덤한 값, 예: openssl rand -hex 32>
+#  MCP_PORT=8791
+docker build -t moodle-mcp:p0 .
+cp .env deploy/.env && cd deploy && docker compose up -d
+curl http://localhost:8791/health
 ```
+- compose는 `localhost`에만 바인딩하니, 외부 공개는 리버스 프록시(nginx/Caddy 등, TLS)로 `https://mcp.example.com/mcp` 형태로 열어 주세요.
+- 로컬 개발: `pip install -r requirements-dev.txt && pytest`.
 
-The image is `python:3.12-slim` (multi-stage build) and runs as a non-root user. Idle RSS is about 60 MB.
-
-## Example request
-
+### 3. Grok Bot 연결
 ```bash
-curl -s localhost:8791/mcp \
-  -H "Authorization: Bearer $MCP_BEARER_TOKEN" \
-  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"site_info","arguments":{}}}'
+npx mcp-remote https://mcp.example.com/mcp --header "Authorization: Bearer ${MCP_BEARER_TOKEN}"
 ```
+커넥터 도구 목록은 앱이 캐시하므로, 도구를 추가/변경하면 커넥터를 다시 추가해야 반영됩니다.
 
-## Tests
+## 데모 시나리오 — 강좌 8 「AI 에이전트 시대의 교육」
+자세한 내용은 [`docs/course8_share.md`](docs/course8_share.md).
+1. 교사가 "테스트 강좌 만들어 줘" → `list_categories` + `create_course` 미리보기 → 승인 → 강좌 생성.
+2. AI교수법 조교가 8차시 설계안 작성, 슬라이드 에이전트가 덱 8개(pptx+pdf) 제작 (`docs/moodle-design/`).
+3. 무들봇이 81단계 빌드 계획을 단계별 미리보기로 제시 → 교사 승인.
+4. 실행: `add_sections`/`update_section` → 차시별 `create_page`·`create_resource` → 퀴즈(`create_quiz`+`add_quiz_questions`), 포럼, 위키, 용어집, 과제, 워크숍, 설문, OpenMAIC 활동 → `set_rubric`·`set_completion`·`set_access_restriction`(순차 잠금)·`set_grade_categories`·`create_badge`.
+5. 결과: 약 10분 만에 전체 빌드, 오류 0건.
 
-```bash
-.venv/bin/pytest
-```
+## 관련 작업
+- **mod_openmaic**(OpenMAIC Moodle 플러그인)은 별도로 관리되며 이 리포에는 포함되지 않습니다. 여기서는 `create_openmaic` 도구가 이미 설치된 모듈을 호출만 합니다.
 
-The tests use fake env values and mock Moodle with `respx`, so they don't need a network connection.
+## 참고
+- 스크린샷은 관리자 이름이 노출돼 있고 크롭본이 없어 제외했습니다.
+- 강의 영상(약 1.9GB)과 base64 중간 산출물은 용량 문제로 제외했습니다.
+- 서버 원본 영문 README: [`docs/SERVER_README_en.md`](docs/SERVER_README_en.md)
