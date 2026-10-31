@@ -10,6 +10,11 @@ from .conftest import ENDPOINT, MOODLE_TOKEN
 from .test_moodle import form
 
 BASE = {"wstoken": MOODLE_TOKEN, "moodlewsrestformat": "json"}
+WRITE_TOOLS = {
+    "create_course", "create_assignment", "create_quiz", "create_forum", "create_page", "create_resource",
+    "update_activity", "set_activity_visibility", "set_completion", "set_access_restriction",
+    "add_quiz_questions", "add_sections", "update_section", "post_forum_discussion",
+}  # fmt: skip
 
 
 @pytest.fixture
@@ -166,10 +171,12 @@ async def test_write_tools_are_marked(mcp):
         "site_info", "list_courses", "get_course_outline", "list_students", "list_assignments",
         "get_submissions", "get_assignment_grades", "gradebook_overview", "list_quizzes", "list_quiz_attempts", "review_attempt",
         "attendance_sessions", "grade_submission", "bulk_grade", "list_categories", "create_course",
+        "list_forum_discussions", *WRITE_TOOLS,
     }  # fmt: skip
-    for name in ("grade_submission", "bulk_grade", "create_course"):
+    writes = {"grade_submission", "bulk_grade", *WRITE_TOOLS}
+    for name in writes:
         assert WRITE_NOTE in tools[name].description
-    for name in set(tools) - {"grade_submission", "bulk_grade", "create_course"}:
+    for name in set(tools) - writes:
         assert "WRITE" not in (tools[name].description or "")
 
 

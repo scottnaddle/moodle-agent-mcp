@@ -36,10 +36,32 @@ Token values are never logged or included in error messages. See `.env.example`;
 | `attendance_sessions(attendance_id)` | `mod_attendance_get_sessions` |
 | `grade_submission(...)` **WRITE** | `mod_assign_save_grade` |
 | `bulk_grade(assignment_id, grades)` **WRITE** | `mod_assign_save_grades` |
+| `get_assignment_grades(assignment_ids)` | `mod_assign_get_grades` |
+| `list_categories()` | `core_course_get_categories` |
+| `list_forum_discussions(forum_id)` | `mod_forum_get_forum_discussions` + `mod_forum_get_discussion_posts` per discussion |
+| `create_course(...)` **WRITE, preview** | `core_course_create_courses` + `enrol_manual_enrol_users` |
+| `create_assignment(course_id, section, name, ...)` **WRITE, preview** | `local_grokbot_create_module` (assign) |
+| `create_quiz(course_id, section, name, ...)` **WRITE, preview** | `local_grokbot_create_module` (quiz) |
+| `create_forum(course_id, section, name, ...)` **WRITE, preview** | `local_grokbot_create_module` (forum) |
+| `create_page(course_id, section, name, content_html, video_url=None, ...)` **WRITE, preview** | `local_grokbot_create_module` (page) |
+| `create_resource(course_id, section, name, filename, file_url \| file_base64, ...)` **WRITE, preview** | `core_files_upload` to the bot's draft area, then `local_grokbot_create_module` (resource) |
+| `update_activity(cmid, name, intro, visible, settings)` **WRITE, preview** | `local_grokbot_update_module` |
+| `set_activity_visibility(cmid, visible)` **WRITE, preview** | `core_course_edit_module` (show/hide) |
+| `set_completion(cmid, mode, posts, pass_grade)` **WRITE, preview** | `local_grokbot_update_module` |
+| `set_access_restriction(target_type, course_id, target, required_cmids, open_from)` **WRITE, preview** | `local_grokbot_update_module` / `local_grokbot_set_section_availability` |
+| `add_quiz_questions(quiz_id, questions)` **WRITE, preview** | `local_grokbot_add_quiz_questions` |
+| `add_sections(course_id, names, summaries)` **WRITE, preview** | `local_grokbot_add_sections` |
+| `update_section(course_id, section, name, summary)` **WRITE, preview** | `local_grokbot_update_section` |
+| `post_forum_discussion(forum_id, subject, message)` **WRITE, preview** | `mod_forum_add_discussion` |
 
 Every tool returns a JSON object. Moodle responses are returned unchanged when they are objects. Lists and nulls are wrapped (for example `{"courses": [...]}`, `{"users": [...]}`, `{"result": null}`), and the write tools add `"ok": true`.
 Moodle errors come back as `{"error": "<wsfunction>: [errorcode] message"}`.
 WRITE tools are described as "only call after the teacher confirmed".
+Tools marked *preview* take `confirm` (default `false`): without it they return `{"preview": true, ...}`
+describing the change and make no Moodle call; with `confirm=true` they apply it.
+`local_grokbot_*` functions come from the `local_grokbot` Moodle plugin (version 0.2.0 or later).
+`create_resource` downloads `file_url` (http/https, max 200 MB) into memory on the MCP server and sends the
+file base64-encoded, so Moodle's `post_max_size` must allow roughly 1.4x the file size.
 
 Your Moodle web service must include all of these functions, and the token's user needs the matching capabilities.
 `mod_attendance_get_sessions` requires the Attendance plugin.
