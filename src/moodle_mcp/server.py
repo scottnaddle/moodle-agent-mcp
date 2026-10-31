@@ -361,7 +361,7 @@ def create_mcp(client: MoodleClient) -> FastMCP:
         module = {"course_id": course_id, "section": section, "modname": modname, "name": name,
                   "intro": intro, "visible": visible, "settings": settings}  # fmt: skip
         return await write(
-            "local_grokbot_create_module", {"module": module}, confirm,
+            "local_ubionai_create_module", {"module": module}, confirm,
             courseid=course_id, section=section, modname=modname, name=name, intro=intro, visible=visible,
             settings=json.dumps(settings),
         )  # fmt: skip
@@ -752,7 +752,7 @@ def create_mcp(client: MoodleClient) -> FastMCP:
         preview = {"cmid": cmid, "name": name, "area": area, "criteria": payload,
                    "max_score": sum(max(lv.score for lv in c.levels) for c in criteria)}  # fmt: skip
         return await write(
-            "local_grokbot_set_rubric", preview, confirm,
+            "local_ubionai_set_rubric", preview, confirm,
             cmid=cmid, name=name, criteria=json.dumps(payload), description=description, areaname=area,
         )  # fmt: skip
 
@@ -777,7 +777,7 @@ def create_mcp(client: MoodleClient) -> FastMCP:
         if aggregation != "mean":
             preview["total_weight"] = sum(c.weight or 0 for c in categories)
         return await write(
-            "local_grokbot_set_grade_categories", preview, confirm,
+            "local_ubionai_set_grade_categories", preview, confirm,
             courseid=course_id, categories=json.dumps(payload), aggregation=aggregation,
         )  # fmt: skip
 
@@ -804,12 +804,12 @@ def create_mcp(client: MoodleClient) -> FastMCP:
         preview = {"course_id": course_id, "name": name, "description": description, "criteria": criteria,
                    "enable": enable}  # fmt: skip
         return await write(
-            "local_grokbot_create_badge", preview, confirm,
+            "local_ubionai_create_badge", preview, confirm,
             courseid=course_id, name=name, description=description, criteria=json.dumps(criteria), enable=enable,
         )  # fmt: skip
 
     @mcp.tool(
-        description=f"{WRITE_NOTE} Update an activity (local_grokbot_update_module). {CONFIRM_NOTE} "
+        description=f"{WRITE_NOTE} Update an activity (local_ubionai_update_module). {CONFIRM_NOTE} "
         "Empty name/intro and visible=-1 mean unchanged. settings: module fields to change, e.g. "
         '{"duedate": 1767225600} or {"timeclose": ...}; other settings are kept.'
     )
@@ -823,7 +823,7 @@ def create_mcp(client: MoodleClient) -> FastMCP:
     ) -> dict[str, Any]:
         change = {"cmid": cmid, "name": name, "intro": intro, "visible": visible, "settings": settings}
         return await write(
-            "local_grokbot_update_module", {"change": change}, confirm,
+            "local_ubionai_update_module", {"change": change}, confirm,
             cmid=cmid, name=name, intro=intro, visible=visible, settings=json.dumps(settings),
         )  # fmt: skip
 
@@ -867,7 +867,7 @@ def create_mcp(client: MoodleClient) -> FastMCP:
             case _:
                 return {"error": f"mode must be one of {sorted(COMPLETION_MODES)}"}
         return await write(
-            "local_grokbot_update_module", {"cmid": cmid, "settings": settings}, confirm,
+            "local_ubionai_update_module", {"cmid": cmid, "settings": settings}, confirm,
             cmid=cmid, settings=json.dumps(settings),
         )  # fmt: skip
 
@@ -888,12 +888,12 @@ def create_mcp(client: MoodleClient) -> FastMCP:
         preview = {"target_type": target_type, "course_id": course_id, "target": target, "availability": availability}
         if target_type == "activity":
             return await write(
-                "local_grokbot_update_module", preview, confirm,
+                "local_ubionai_update_module", preview, confirm,
                 cmid=target, settings=json.dumps({"availability": availability}),
             )  # fmt: skip
         if target_type == "section":
             return await write(
-                "local_grokbot_set_section_availability", preview, confirm,
+                "local_ubionai_set_section_availability", preview, confirm,
                 courseid=course_id, section=target, availability=availability,
             )  # fmt: skip
         return {"error": "target_type must be 'activity' or 'section'"}
@@ -905,7 +905,7 @@ def create_mcp(client: MoodleClient) -> FastMCP:
     async def add_quiz_questions(quiz_id: int, questions: list[QuizQuestion], confirm: bool = False) -> dict[str, Any]:
         payload = [q.model_dump(exclude_none=True) for q in questions]
         return await write(
-            "local_grokbot_add_quiz_questions", {"quiz_id": quiz_id, "questions": payload}, confirm,
+            "local_ubionai_add_quiz_questions", {"quiz_id": quiz_id, "questions": payload}, confirm,
             quizid=quiz_id, questions=json.dumps(payload),
         )  # fmt: skip
 
@@ -919,7 +919,7 @@ def create_mcp(client: MoodleClient) -> FastMCP:
         if summaries and len(summaries) > len(names):
             return {"error": "summaries must not have more items than names"}
         return await write(
-            "local_grokbot_add_sections", {"course_id": course_id, "names": names, "summaries": summaries or []},
+            "local_ubionai_add_sections", {"course_id": course_id, "names": names, "summaries": summaries or []},
             confirm, courseid=course_id, names=names, summaries=summaries or None,
         )  # fmt: skip
 
@@ -933,7 +933,7 @@ def create_mcp(client: MoodleClient) -> FastMCP:
         if name is None and summary is None:
             return {"error": "give name and/or summary"}
         return await write(
-            "local_grokbot_update_section",
+            "local_ubionai_update_section",
             {"course_id": course_id, "section": section, "name": name, "summary": summary}, confirm,
             courseid=course_id, section=section, name=name, summary=summary,
         )  # fmt: skip

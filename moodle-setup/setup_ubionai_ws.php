@@ -1,8 +1,8 @@
 <?php
 // Grok Bot MCP — Moodle web service setup (idempotent CLI script).
 // Usage (from the Moodle dirroot, i.e. where config.php lives):
-//   sudo -u www-data php /path/to/setup_grokbot_ws.php [--username=svc_grokbot] [--email=svc_grokbot@example.invalid]
-//        [--service=grokbot] [--role=grokbot_service] [--iprestriction=203.0.113.10] [--token-file=/root/grokbot.token]
+//   sudo -u www-data php /path/to/setup_ubionai_ws.php [--username=svc_ubionai] [--email=svc_ubionai@example.invalid]
+//        [--service=ubionai] [--role=ubionai_service] [--iprestriction=203.0.113.10] [--token-file=/root/ubionai.token]
 //        [--moodle=/var/www/moodle] [--no-token]
 // What it does: enables web services + REST, creates a dedicated manual-auth user, a system role
 // (manager archetype capabilities + webservice/rest:use), a restricted external service with the
@@ -25,10 +25,10 @@ require_once($CFG->dirroot . '/user/lib.php');
 require_once($CFG->libdir . '/externallib.php');
 if (file_exists($CFG->dirroot . '/webservice/lib.php')) { require_once($CFG->dirroot . '/webservice/lib.php'); }
 
-$username = $opts['username'] ?? 'svc_grokbot';
-$email = $opts['email'] ?? 'svc_grokbot@example.invalid';
-$svcshort = $opts['service'] ?? 'grokbot';
-$roleshort = $opts['role'] ?? 'grokbot_service';
+$username = $opts['username'] ?? 'svc_ubionai';
+$email = $opts['email'] ?? 'svc_ubionai@example.invalid';
+$svcshort = $opts['service'] ?? 'ubionai';
+$roleshort = $opts['role'] ?? 'ubionai_service';
 $ip = $opts['iprestriction'] ?? '';
 $tokenfile = $opts['token-file'] ?? '';
 
@@ -42,8 +42,8 @@ if (!in_array('rest', $protocols)) { $protocols[] = 'rest'; set_config('webservi
 cli_writeln('[ok] web services + REST enabled');
 
 // 2. Plugin check.
-if (!get_config('local_grokbot', 'version')) {
-    cli_problem('local_grokbot is not installed — local_grokbot_* functions will be skipped. Install it first (see INSTALL.md).');
+if (!get_config('local_ubionai', 'version')) {
+    cli_problem('local_ubionai is not installed — local_ubionai_* functions will be skipped. Install it first (see INSTALL.md).');
 }
 
 // 3. Service user.
@@ -94,10 +94,10 @@ $functions = [
   'mod_forum_add_discussion','mod_forum_get_forum_discussions','mod_forum_get_discussion_posts',
   // optional: mod_attendance
   'mod_attendance_get_sessions','mod_attendance_get_session','mod_attendance_add_attendance','mod_attendance_add_session','mod_attendance_update_user_status',
-  // local_grokbot (9)
-  'local_grokbot_create_module','local_grokbot_update_module','local_grokbot_add_quiz_questions','local_grokbot_update_section',
-  'local_grokbot_add_sections','local_grokbot_set_section_availability','local_grokbot_set_rubric',
-  'local_grokbot_set_grade_categories','local_grokbot_create_badge',
+  // local_ubionai (9)
+  'local_ubionai_create_module','local_ubionai_update_module','local_ubionai_add_quiz_questions','local_ubionai_update_section',
+  'local_ubionai_add_sections','local_ubionai_set_section_availability','local_ubionai_set_rubric',
+  'local_ubionai_set_grade_categories','local_ubionai_create_badge',
 ];
 $svc = $DB->get_record('external_services', ['shortname' => $svcshort]);
 if (!$svc) {
@@ -136,7 +136,7 @@ cli_writeln("[ok] $username authorised for $svcshort" . ($ip ? " (IP restriction
 // 7. Token.
 if (empty($opts['no-token'])) {
     $tok = \core_external\util::generate_token(EXTERNAL_TOKEN_PERMANENT, \core_external\util::get_service_by_id($svc->id),
-        $user->id, $sys, 0, $ip ?: '', 'grokbot-mcp');
+        $user->id, $sys, 0, $ip ?: '', 'ubionai-mcp');
     if ($tokenfile) {
         $old = umask(0077); file_put_contents($tokenfile, $tok . "\n"); umask($old); chmod($tokenfile, 0600);
         cli_writeln("[ok] token issued and written to $tokenfile (mode 600)");

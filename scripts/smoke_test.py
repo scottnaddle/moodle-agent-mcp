@@ -63,8 +63,8 @@ async def main():
                     fail += 1; print("[FAIL] bot enrolment as editingteacher:", d["enrol_error"][:120])
                 if cid:
                     await step(s, "get_course_outline", "get_course_outline", {"course_id": cid})
-                    await step(s, "add_sections (local_grokbot)", "add_sections", {"course_id": cid, "names": ["Smoke"], "confirm": True})
-                    await step(s, "create_page (local_grokbot)", "create_page", {"course_id": cid, "section": 1, "name": "Hello", "content_html": "<p>hi</p>", "confirm": True})
+                    await step(s, "add_sections (local_ubionai)", "add_sections", {"course_id": cid, "names": ["Smoke"], "confirm": True})
+                    await step(s, "create_page (local_ubionai)", "create_page", {"course_id": cid, "section": 1, "name": "Hello", "content_html": "<p>hi</p>", "confirm": True})
                     await step(s, "create_assignment", "create_assignment", {"course_id": cid, "section": 1, "name": "Task", "confirm": True})
                     await step(s, "list_assignments", "list_assignments", {"course_ids": [cid]})
                     await step(s, "list_students", "list_students", {"course_id": cid})

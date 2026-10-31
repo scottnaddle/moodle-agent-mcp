@@ -45,7 +45,7 @@ WRITES = [
     (
         "create_assignment",
         {**MODULE, "duedate": 100, "submission_types": ["onlinetext", "file"], "max_files": 3, "completion_submit": True},
-        "local_grokbot_create_module",
+        "local_ubionai_create_module",
         {
             "courseid": "5", "section": "2", "modname": "assign", "name": "N", "intro": "", "visible": "1",
             "settings": {
@@ -57,7 +57,7 @@ WRITES = [
     (
         "create_assignment",
         {**MODULE, "intro": "<p>x</p>", "visible": 0, "grade": 20, "cutoffdate": 9, "allowsubmissionsfromdate": 1},
-        "local_grokbot_create_module",
+        "local_ubionai_create_module",
         {
             "courseid": "5", "section": "2", "modname": "assign", "name": "N", "intro": "<p>x</p>", "visible": "0",
             "settings": {
@@ -69,7 +69,7 @@ WRITES = [
     (
         "create_quiz",
         {**MODULE, "timeopen": 10, "timelimit": 1800, "attempts": 2, "completion_pass_grade": 6},
-        "local_grokbot_create_module",
+        "local_ubionai_create_module",
         {
             "courseid": "5", "section": "2", "modname": "quiz", "name": "N", "intro": "", "visible": "1",
             "settings": {
@@ -81,7 +81,7 @@ WRITES = [
     (
         "create_forum",
         {**MODULE, "type": "qanda", "max_grade": 10, "duedate": 7, "completion_posts": 2},
-        "local_grokbot_create_module",
+        "local_ubionai_create_module",
         {
             "courseid": "5", "section": "2", "modname": "forum", "name": "N", "intro": "", "visible": "1",
             "settings": {"type": "qanda", "grade_forum": 10, "duedate": 7, "completion": 2, "completionposts": 2},
@@ -90,7 +90,7 @@ WRITES = [
     (
         "create_page",
         {**MODULE, "content_html": "<p>Hi</p>", "completion_view": False},
-        "local_grokbot_create_module",
+        "local_ubionai_create_module",
         {
             "courseid": "5", "section": "2", "modname": "page", "name": "N", "intro": "", "visible": "1",
             "settings": {"content": "<p>Hi</p>"},
@@ -99,7 +99,7 @@ WRITES = [
     (
         "create_page",
         {**MODULE, "content_html": "<p>Hi</p>", "video_url": YT},
-        "local_grokbot_create_module",
+        "local_ubionai_create_module",
         {
             "courseid": "5", "section": "2", "modname": "page", "name": "N", "intro": "", "visible": "1",
             "settings": {"content": "<p>Hi</p>" + _video_embed(YT), "completion": 2, "completionview": 1},
@@ -108,45 +108,45 @@ WRITES = [
     (
         "update_activity",
         {"cmid": 12, "name": "New", "settings": {"duedate": 5}},
-        "local_grokbot_update_module",
+        "local_ubionai_update_module",
         {"cmid": "12", "name": "New", "intro": "", "visible": "-1", "settings": {"duedate": 5}},
     ),
-    ("set_completion", {"cmid": 12, "mode": "none"}, "local_grokbot_update_module", {"cmid": "12", "settings": {"completion": 0}}),
-    ("set_completion", {"cmid": 12, "mode": "manual"}, "local_grokbot_update_module", {"cmid": "12", "settings": {"completion": 1}}),
+    ("set_completion", {"cmid": 12, "mode": "none"}, "local_ubionai_update_module", {"cmid": "12", "settings": {"completion": 0}}),
+    ("set_completion", {"cmid": 12, "mode": "manual"}, "local_ubionai_update_module", {"cmid": "12", "settings": {"completion": 1}}),
     (
         "set_completion",
         {"cmid": 12, "mode": "view"},
-        "local_grokbot_update_module",
+        "local_ubionai_update_module",
         {"cmid": "12", "settings": {"completion": 2, "completionview": 1}},
     ),
     (
         "set_completion",
         {"cmid": 12, "mode": "submit"},
-        "local_grokbot_update_module",
+        "local_ubionai_update_module",
         {"cmid": "12", "settings": {"completion": 2, "completionsubmit": 1}},
     ),
     (
         "set_completion",
         {"cmid": 12, "mode": "grade"},
-        "local_grokbot_update_module",
+        "local_ubionai_update_module",
         {"cmid": "12", "settings": {"completion": 2, "completionusegrade": 1}},
     ),
     (
         "set_completion",
         {"cmid": 12, "mode": "pass", "pass_grade": 5.5},
-        "local_grokbot_update_module",
+        "local_ubionai_update_module",
         {"cmid": "12", "settings": {"completion": 2, "completionusegrade": 1, "completionpassgrade": 1, "gradepass": 5.5}},
     ),
     (
         "set_completion",
         {"cmid": 12, "mode": "posts", "posts": 3},
-        "local_grokbot_update_module",
+        "local_ubionai_update_module",
         {"cmid": "12", "settings": {"completion": 2, "completionposts": 3}},
     ),
     (
         "set_access_restriction",
         {"target_type": "activity", "course_id": 5, "target": 12, "required_cmids": [3, 4], "open_from": 1000},
-        "local_grokbot_update_module",
+        "local_ubionai_update_module",
         {
             "cmid": "12",
             "settings": {
@@ -167,7 +167,7 @@ WRITES = [
     (
         "set_access_restriction",
         {"target_type": "section", "course_id": 5, "target": 2, "required_cmids": [3]},
-        "local_grokbot_set_section_availability",
+        "local_ubionai_set_section_availability",
         {
             "courseid": "5",
             "section": "2",
@@ -177,7 +177,7 @@ WRITES = [
     (
         "set_access_restriction",
         {"target_type": "section", "course_id": 5, "target": 2},
-        "local_grokbot_set_section_availability",
+        "local_ubionai_set_section_availability",
         {"courseid": "5", "section": "2", "availability": ""},
     ),
     (
@@ -189,7 +189,7 @@ WRITES = [
                 {"type": "multichoice", "text": "2+2", "answers": [{"text": "4", "fraction": 1}, {"text": "5"}]},
             ],
         },
-        "local_grokbot_add_quiz_questions",
+        "local_ubionai_add_quiz_questions",
         {
             "quizid": "4",
             "questions": [
@@ -207,26 +207,26 @@ WRITES = [
     (
         "add_sections",
         {"course_id": 5, "names": ["A", "B"], "summaries": ["<p>a</p>"]},
-        "local_grokbot_add_sections",
+        "local_ubionai_add_sections",
         {"courseid": "5", "names[0]": "A", "names[1]": "B", "summaries[0]": "<p>a</p>"},
     ),
-    ("add_sections", {"course_id": 5, "names": ["A"]}, "local_grokbot_add_sections", {"courseid": "5", "names[0]": "A"}),
+    ("add_sections", {"course_id": 5, "names": ["A"]}, "local_ubionai_add_sections", {"courseid": "5", "names[0]": "A"}),
     (
         "update_section",
         {"course_id": 5, "section": 1, "name": "Week 1"},
-        "local_grokbot_update_section",
+        "local_ubionai_update_section",
         {"courseid": "5", "section": "1", "name": "Week 1"},
     ),
     (
         "update_section",
         {"course_id": 5, "section": 1, "summary": "<p>s</p>"},
-        "local_grokbot_update_section",
+        "local_ubionai_update_section",
         {"courseid": "5", "section": "1", "summary": "<p>s</p>"},
     ),
     (
         "create_workshop",
         {**MODULE, "instructions_submission": "<p>s</p>", "submission_end": 50, "settings": {"nattachments": 3}},
-        "local_grokbot_create_module",
+        "local_ubionai_create_module",
         {
             "courseid": "5", "section": "2", "modname": "workshop", "name": "N", "intro": "", "visible": "1",
             "settings": {
@@ -239,7 +239,7 @@ WRITES = [
         "create_workshop",
         {**MODULE, "strategy": "accumulative", "grade": 25, "gradinggrade": 10, "submission_types": ["file"],
          "self_assessment": True, "instructions_assessment": "<p>a</p>", "assessment_start": 7},
-        "local_grokbot_create_module",
+        "local_ubionai_create_module",
         {
             "courseid": "5", "section": "2", "modname": "workshop", "name": "N", "intro": "", "visible": "1",
             "settings": {
@@ -251,7 +251,7 @@ WRITES = [
     (
         "create_wiki",
         {**MODULE, "mode": "individual", "first_page_title": "Start", "group_mode": 1},
-        "local_grokbot_create_module",
+        "local_ubionai_create_module",
         {
             "courseid": "5", "section": "2", "modname": "wiki", "name": "N", "intro": "", "visible": "1",
             "settings": {"wikimode": "individual", "groupmode": 1, "firstpagetitle": "Start"},
@@ -260,7 +260,7 @@ WRITES = [
     (
         "create_glossary",
         {**MODULE, "default_approval": False, "completion_entries": 2},
-        "local_grokbot_create_module",
+        "local_ubionai_create_module",
         {
             "courseid": "5", "section": "2", "modname": "glossary", "name": "N", "intro": "", "visible": "1",
             "settings": {
@@ -272,7 +272,7 @@ WRITES = [
     (
         "create_feedback",
         {**MODULE, "anonymous": False, "timeclose": 99, "page_after_submit": "<p>Thanks</p>", "completion_submit": True},
-        "local_grokbot_create_module",
+        "local_ubionai_create_module",
         {
             "courseid": "5", "section": "2", "modname": "feedback", "name": "N", "intro": "", "visible": "1",
             "settings": {
@@ -284,7 +284,7 @@ WRITES = [
     (
         "create_openmaic",
         {**MODULE, "prompt": "Teach agents", "settings": {"grade": 0}},
-        "local_grokbot_create_module",
+        "local_ubionai_create_module",
         {
             "courseid": "5", "section": "2", "modname": "openmaic", "name": "N", "intro": "", "visible": "1",
             "settings": {"grade": 0, "manuscript": "Teach agents", "completion": 2, "completionminprogress": 80},
@@ -293,7 +293,7 @@ WRITES = [
     (
         "create_openmaic",
         {**MODULE, "lecture_id": "abc-1", "completion_min_progress": 0},
-        "local_grokbot_create_module",
+        "local_ubionai_create_module",
         {
             "courseid": "5", "section": "2", "modname": "openmaic", "name": "N", "intro": "", "visible": "1",
             "settings": {"grade": 100, "lectureid": "abc-1"},
@@ -302,7 +302,7 @@ WRITES = [
     (
         "set_rubric",
         {"cmid": 12, "name": "R", "criteria": RUBRIC},
-        "local_grokbot_set_rubric",
+        "local_ubionai_set_rubric",
         {"cmid": "12", "name": "R", "criteria": RUBRIC, "description": "", "areaname": "submissions"},
     ),
     (
@@ -311,7 +311,7 @@ WRITES = [
             {"name": "Quizzes", "weight": 15, "cmids": [3, 4]},
             {"name": "Peer review", "weight": 10, "cmids": [{"cmid": 9, "itemnumber": 1}]},
         ]},
-        "local_grokbot_set_grade_categories",
+        "local_ubionai_set_grade_categories",
         {
             "courseid": "5", "aggregation": "weighted_mean",
             "categories": [
@@ -323,13 +323,13 @@ WRITES = [
     (
         "set_grade_categories",
         {"course_id": 5, "aggregation": "mean", "categories": [{"name": "All"}]},
-        "local_grokbot_set_grade_categories",
+        "local_ubionai_set_grade_categories",
         {"courseid": "5", "aggregation": "mean", "categories": [{"name": "All", "cmids": []}]},
     ),
     (
         "create_badge",
         {"course_id": 5, "name": "B", "description": "D", "activity_cmids": [3, 4], "min_course_grade": 70, "enable": True},
-        "local_grokbot_create_badge",
+        "local_ubionai_create_badge",
         {
             "courseid": "5", "name": "B", "description": "D", "enable": "1",
             "criteria": {"activities": [3, 4], "min_course_grade": 70.0},
@@ -338,7 +338,7 @@ WRITES = [
     (
         "create_badge",
         {"course_id": 5, "name": "B", "description": "D", "activity_cmids": [3]},
-        "local_grokbot_create_badge",
+        "local_ubionai_create_badge",
         {
             "courseid": "5", "name": "B", "description": "D", "enable": "0",
             "criteria": {"activities": [3], "min_course_grade": None},
@@ -450,7 +450,7 @@ PDF = b"%PDF-1.4 fake"
 RESOURCE_REPLIES = {
     "core_webservice_get_site_info": {"userid": 10},
     "core_files_upload": {"itemid": 555, "filename": "notes.pdf", "contextid": 2},
-    "local_grokbot_create_module": {"cmid": 77, "instance": 8, "modname": "resource"},
+    "local_ubionai_create_module": {"cmid": 77, "instance": 8, "modname": "resource"},
 }
 
 
@@ -475,7 +475,7 @@ async def test_create_resource_base64_uploads_then_creates(mcp):
     assert [c["wsfunction"] for c in calls] == [
         "core_webservice_get_site_info",
         "core_files_upload",
-        "local_grokbot_create_module",
+        "local_ubionai_create_module",
     ]
     upload = calls[1]
     assert {k: upload[k] for k in ("contextlevel", "instanceid", "component", "filearea", "itemid", "filepath")} == {
@@ -613,7 +613,7 @@ H5P = b"PK\x03\x04 fake h5p"
 
 
 async def test_create_h5pactivity_uploads_package(mcp):
-    replies = {**RESOURCE_REPLIES, "local_grokbot_create_module": {"cmid": 78, "instance": 9, "modname": "h5pactivity"}}
+    replies = {**RESOURCE_REPLIES, "local_ubionai_create_module": {"cmid": 78, "instance": 9, "modname": "h5pactivity"}}
     args = {**MODULE, "filename": "tutor.h5p", "file_base64": base64.b64encode(H5P).decode(), "completion_pass_grade": 60}
     with respx.mock:
         route = respx.post(ENDPOINT).mock(side_effect=routed(replies))
@@ -627,7 +627,7 @@ async def test_create_h5pactivity_uploads_package(mcp):
     assert [c["wsfunction"] for c in calls] == [
         "core_webservice_get_site_info",
         "core_files_upload",
-        "local_grokbot_create_module",
+        "local_ubionai_create_module",
     ]
     assert calls[1]["filename"] == "tutor.h5p" and base64.b64decode(calls[1]["filecontent"]) == H5P
     assert calls[2]["modname"] == "h5pactivity"
