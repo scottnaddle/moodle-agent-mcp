@@ -10,7 +10,7 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
+DEFAULT_TIMEOUT = 180.0
 
 
 class MoodleError(Exception):
