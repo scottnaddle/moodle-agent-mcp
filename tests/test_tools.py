@@ -44,6 +44,7 @@ CASES = [
         "mod_assign_get_submissions",
         {"assignmentids[0]": "9", "status": "submitted"},
     ),
+    ("list_categories", {}, "core_course_get_categories", {}),
     ("get_assignment_grades", {"assignment_ids": [9]}, "mod_assign_get_grades", {"assignmentids[0]": "9"}),
     ("gradebook_overview", {"course_id": 5}, "gradereport_user_get_grade_items", {"courseid": "5"}),
     (
@@ -164,9 +165,38 @@ async def test_write_tools_are_marked(mcp):
     assert set(tools) == {
         "site_info", "list_courses", "get_course_outline", "list_students", "list_assignments",
         "get_submissions", "get_assignment_grades", "gradebook_overview", "list_quizzes", "list_quiz_attempts", "review_attempt",
-        "attendance_sessions", "grade_submission", "bulk_grade",
+        "attendance_sessions", "grade_submission", "bulk_grade", "list_categories", "create_course",
     }  # fmt: skip
-    for name in ("grade_submission", "bulk_grade"):
+    for name in ("grade_submission", "bulk_grade", "create_course"):
         assert WRITE_NOTE in tools[name].description
-    for name in set(tools) - {"grade_submission", "bulk_grade"}:
+    for name in set(tools) - {"grade_submission", "bulk_grade", "create_course"}:
         assert "WRITE" not in (tools[name].description or "")
+
+
+async def test_create_course_preview_does_not_call_moodle(mcp):
+    with respx.mock:
+        route = respx.post(ENDPOINT).respond(text="{}")
+        _c, out = await mcp.call_tool("create_course", {"fullname": "F", "shortname": "S", "numsections": 4})
+        assert route.call_count == 0
+    assert out["preview"] is True
+    assert out["course"]["courseformatoptions"] == [{"name": "numsections", "value": "4"}]
+
+
+async def test_create_course_confirm_creates_and_enrols(mcp):
+    replies = {
+        "core_course_create_courses": [{"id": 42, "shortname": "S"}],
+        "core_webservice_get_site_info": {"userid": 10},
+        "enrol_manual_enrol_users": None,
+    }
+    with respx.mock:
+        route = respx.post(ENDPOINT).mock(
+            side_effect=lambda req: respx.MockResponse(text=json.dumps(replies[form(req)["wsfunction"]]))
+        )
+        _c, out = await mcp.call_tool(
+            "create_course", {"fullname": "F", "shortname": "S", "categoryid": 1, "confirm": True}
+        )
+        calls = [form(c.request) for c in route.calls]
+    assert out == {"ok": True, "courseid": 42, "shortname": "S", "enrolled_userid": 10}
+    assert calls[0]["courses[0][fullname]"] == "F" and calls[0]["courses[0][categoryid]"] == "1"
+    assert calls[2]["enrolments[0][roleid]"] == "3"
+    assert calls[2]["enrolments[0][userid]"] == "10" and calls[2]["enrolments[0][courseid]"] == "42"
