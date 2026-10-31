@@ -10,10 +10,17 @@ import stat
 from typing import Union
 
 from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 FIELD_MOODLE_TOKEN = "moodle_token"
 FIELD_LITELLM_KEY = "litellm_key"
+
+PURPOSE_PSEUDONYM_HMAC = "pseudonym-hmac"
+PURPOSE_PSEUDONYM_MAP = "pseudonym-map"
+
+_HKDF_SALT = b"ubionai-hub/hkdf/v1"
 
 _VERSION = b"\x01"
 _NONCE_LEN = 12
@@ -44,6 +51,17 @@ class Kek:
 
     def __repr__(self) -> str:
         return f"Kek(kek_id={self.kek_id!r})"
+
+
+def derive_key(kek: Kek, purpose: str, site_id: str) -> bytes:
+    """Derive a 32-byte tenant- and purpose-specific key from the KEK."""
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=_HKDF_SALT,
+        info=purpose.encode("ascii") + b"\x00" + site_id.encode("utf-8"),
+    )
+    return hkdf.derive(kek._raw)
 
 
 def load_kek(path: Union[str, os.PathLike[str]]) -> Kek:

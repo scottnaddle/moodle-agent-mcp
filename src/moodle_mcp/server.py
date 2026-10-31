@@ -25,9 +25,16 @@ from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from .crypto import DecryptError, Kek, KekError, load_kek
+from .crypto import (
+    PURPOSE_PSEUDONYM_HMAC,
+    DecryptError,
+    Kek,
+    KekError,
+    derive_key,
+    load_kek,
+)
 from .moodle import MoodleClient, MoodleError
-from .pseudonym import Pseudonymizer
+from .pseudonym import Pseudonymizer, RegistryPseudonymMap
 from .registry import DuplicateSite, Registry, TenantError, normalize_moodle_url, ws_endpoint
 
 logger = logging.getLogger(__name__)
@@ -43,9 +50,17 @@ class BodyTooLarge(Exception):
 
 
 class _PseudonymizerStore:
-    """Process-local, per-tenant placeholder mappings used across requests."""
+    """Process-local per-tenant pseudonymizer objects sharing the registry map."""
 
-    def __init__(self, ttl_seconds: int = 3600, max_entries: int = 512) -> None:
+    def __init__(
+        self,
+        registry: Registry,
+        kek: Kek,
+        ttl_seconds: int = 3600,
+        max_entries: int = 512,
+    ) -> None:
+        self._registry = registry
+        self._kek = kek
         self._ttl = ttl_seconds
         self._max_entries = max_entries
         self._items: dict[str, tuple[Pseudonymizer, float]] = {}
@@ -66,7 +81,10 @@ class _PseudonymizerStore:
             if len(self._items) >= self._max_entries:
                 oldest = min(self._items, key=lambda key: self._items[key][1])
                 del self._items[oldest]
-            pseudonymizer = Pseudonymizer()
+            pseudonymizer = Pseudonymizer(
+                derive_key(self._kek, PURPOSE_PSEUDONYM_HMAC, site_id),
+                RegistryPseudonymMap(self._registry, site_id, self._kek),
+            )
             self._items[site_id] = (pseudonymizer, now)
             return pseudonymizer
 TENANT_PATH_RE = re.compile(r"^/t/([a-z0-9][a-z0-9-]{1,62})/mcp/?$")
@@ -94,6 +112,22 @@ YOUTUBE_RE = re.compile(
     r"(?:youtube(?:-nocookie)?\.com/(?:watch\?(?:.*&)?v=|embed/|shorts/|live/)|youtu\.be/)([\w-]{6,})"
 )
 VIMEO_RE = re.compile(r"vimeo\.com/(?:video/)?(\d+)")
+WRITE_FUNCTIONS = frozenset(
+    {
+        "core_course_create_courses",
+        "enrol_manual_enrol_users",
+        "mod_assign_save_grade",
+        "mod_assign_save_grades",
+        "core_files_upload",
+        "core_course_edit_module",
+        "mod_forum_add_discussion",
+    }
+)
+_LOCAL_WRITE_PREFIX = "local_ubionai_"
+
+
+def _is_write(wsfunction: str) -> bool:
+    return wsfunction in WRITE_FUNCTIONS or wsfunction.startswith(_LOCAL_WRITE_PREFIX)
 
 
 class GradeEntry(BaseModel):
@@ -311,6 +345,12 @@ def create_mcp(client: MoodleClient | None) -> FastMCP:
             pass
         return _current_pseudonymizer.get()
 
+    def _dumps(obj: Any) -> str:
+        pseudonymizer = _request_pseudonymizer()
+        if pseudonymizer is not None:
+            obj = pseudonymizer.restore_value(obj)
+        return json.dumps(obj, ensure_ascii=False)
+
     async def call(wsfunction: str, key: str = "result", **params: Any) -> dict[str, Any]:
         active = client or _request_client()
         if active is None:
@@ -318,6 +358,13 @@ def create_mcp(client: MoodleClient | None) -> FastMCP:
         pseudonymizer = _request_pseudonymizer()
         if pseudonymizer is not None:
             params = pseudonymizer.restore_value(params)
+            if _is_write(wsfunction):
+                leftover = pseudonymizer.unresolved(params)
+                if leftover:
+                    return {
+                        "error": "unresolved placeholders",
+                        "placeholders": sorted(leftover),
+                    }
         try:
             result = _wrap(await active.call(wsfunction, **params), key)
         except MoodleError as exc:
@@ -491,7 +538,13 @@ def create_mcp(client: MoodleClient | None) -> FastMCP:
     async def write(wsfunction: str, preview: dict[str, Any], confirm: bool, **params: Any) -> dict[str, Any]:
         """Preview (no Moodle call) unless confirmed; then call and report ok."""
         if not confirm:
-            return {"preview": True, **preview, "note": PREVIEW_NOTE}
+            result = {"preview": True, **preview, "note": PREVIEW_NOTE}
+            pseudonymizer = _request_pseudonymizer()
+            if pseudonymizer is not None:
+                leftover = pseudonymizer.unresolved(params)
+                if leftover:
+                    result["unresolved_placeholders"] = sorted(leftover)
+            return result
         result = await call(wsfunction, **params)
         return result if "error" in result else {"ok": True, **result}
 
@@ -504,7 +557,7 @@ def create_mcp(client: MoodleClient | None) -> FastMCP:
         return await write(
             "local_ubionai_create_module", {"module": module}, confirm,
             courseid=course_id, section=section, modname=modname, name=name, intro=intro, visible=visible,
-            settings=json.dumps(settings),
+            settings=_dumps(settings),
         )  # fmt: skip
 
     @mcp.tool(
@@ -894,7 +947,7 @@ def create_mcp(client: MoodleClient | None) -> FastMCP:
                    "max_score": sum(max(lv.score for lv in c.levels) for c in criteria)}  # fmt: skip
         return await write(
             "local_ubionai_set_rubric", preview, confirm,
-            cmid=cmid, name=name, criteria=json.dumps(payload), description=description, areaname=area,
+            cmid=cmid, name=name, criteria=_dumps(payload), description=description, areaname=area,
         )  # fmt: skip
 
     @mcp.tool(
@@ -919,7 +972,7 @@ def create_mcp(client: MoodleClient | None) -> FastMCP:
             preview["total_weight"] = sum(c.weight or 0 for c in categories)
         return await write(
             "local_ubionai_set_grade_categories", preview, confirm,
-            courseid=course_id, categories=json.dumps(payload), aggregation=aggregation,
+            courseid=course_id, categories=_dumps(payload), aggregation=aggregation,
         )  # fmt: skip
 
     @mcp.tool(
@@ -946,7 +999,7 @@ def create_mcp(client: MoodleClient | None) -> FastMCP:
                    "enable": enable}  # fmt: skip
         return await write(
             "local_ubionai_create_badge", preview, confirm,
-            courseid=course_id, name=name, description=description, criteria=json.dumps(criteria), enable=enable,
+            courseid=course_id, name=name, description=description, criteria=_dumps(criteria), enable=enable,
         )  # fmt: skip
 
     @mcp.tool(
@@ -965,7 +1018,7 @@ def create_mcp(client: MoodleClient | None) -> FastMCP:
         change = {"cmid": cmid, "name": name, "intro": intro, "visible": visible, "settings": settings}
         return await write(
             "local_ubionai_update_module", {"change": change}, confirm,
-            cmid=cmid, name=name, intro=intro, visible=visible, settings=json.dumps(settings),
+            cmid=cmid, name=name, intro=intro, visible=visible, settings=_dumps(settings),
         )  # fmt: skip
 
     @mcp.tool(description=f"{WRITE_NOTE} Show or hide an activity on the course page. {CONFIRM_NOTE}")
@@ -1009,7 +1062,7 @@ def create_mcp(client: MoodleClient | None) -> FastMCP:
                 return {"error": f"mode must be one of {sorted(COMPLETION_MODES)}"}
         return await write(
             "local_ubionai_update_module", {"cmid": cmid, "settings": settings}, confirm,
-            cmid=cmid, settings=json.dumps(settings),
+            cmid=cmid, settings=_dumps(settings),
         )  # fmt: skip
 
     @mcp.tool(
@@ -1030,7 +1083,7 @@ def create_mcp(client: MoodleClient | None) -> FastMCP:
         if target_type == "activity":
             return await write(
                 "local_ubionai_update_module", preview, confirm,
-                cmid=target, settings=json.dumps({"availability": availability}),
+                cmid=target, settings=_dumps({"availability": availability}),
             )  # fmt: skip
         if target_type == "section":
             return await write(
@@ -1047,7 +1100,7 @@ def create_mcp(client: MoodleClient | None) -> FastMCP:
         payload = [q.model_dump(exclude_none=True) for q in questions]
         return await write(
             "local_ubionai_add_quiz_questions", {"quiz_id": quiz_id, "questions": payload}, confirm,
-            quizid=quiz_id, questions=json.dumps(payload),
+            quizid=quiz_id, questions=_dumps(payload),
         )  # fmt: skip
 
     @mcp.tool(
@@ -1327,6 +1380,48 @@ def _pseudonymize_content(content: Any, pseudonymizer: Pseudonymizer) -> Any:
     return parts
 
 
+def _restore_chat_response(data: Any, pseudonymizer: Pseudonymizer) -> Any:
+    if not isinstance(data, dict):
+        return data
+    choices = data.get("choices")
+    if not isinstance(choices, list):
+        return data
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message")
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            message["content"] = pseudonymizer.restore(content)
+        elif isinstance(content, list):
+            for part in content:
+                if (
+                    isinstance(part, dict)
+                    and part.get("type") == "text"
+                    and isinstance(part.get("text"), str)
+                ):
+                    part["text"] = pseudonymizer.restore(part["text"])
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        for call in tool_calls:
+            function = call.get("function") if isinstance(call, dict) else None
+            arguments = function.get("arguments") if isinstance(function, dict) else None
+            if not isinstance(arguments, str):
+                continue
+            try:
+                parsed = json.loads(arguments)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(parsed, (dict, list)):
+                function["arguments"] = json.dumps(
+                    pseudonymizer.restore_value(parsed), ensure_ascii=False
+                )
+    return data
+
+
 def _valid_chat_messages(payload: Any) -> bool:
     if not isinstance(payload, dict):
         return False
@@ -1427,7 +1522,7 @@ async def _handle_chat_proxy(
             await _send_raw(send, upstream.status_code, text.encode(), b"text/plain")
             return
         if pseudonymizer is not None:
-            data = pseudonymizer.restore_value(data)
+            data = _restore_chat_response(data, pseudonymizer)
         await _json(send, upstream.status_code, data)
     finally:
         if key_buf is not None:
@@ -1479,11 +1574,12 @@ class TenantRouterMiddleware:
         self,
         app: ASGIApp,
         registry: Registry,
+        kek: Kek,
         pseudonymizers: _PseudonymizerStore | None = None,
     ) -> None:
         self.app = app
         self.registry = registry
-        self.pseudonymizers = pseudonymizers or _PseudonymizerStore()
+        self.pseudonymizers = pseudonymizers or _PseudonymizerStore(registry, kek)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "lifespan":
@@ -1624,4 +1720,4 @@ def create_app(
     inner = RegisterEndpoint(
         mcp.streamable_http_app(), registry, kek, public_url, egress_ip
     )
-    return TenantRouterMiddleware(inner, registry)
+    return TenantRouterMiddleware(inner, registry, kek)

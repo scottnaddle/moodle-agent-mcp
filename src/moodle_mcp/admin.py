@@ -113,6 +113,9 @@ def build_parser() -> argparse.ArgumentParser:
     issue.add_argument("--ttl", default=None)
     issue.add_argument("--out", required=True)
 
+    purge = sub.add_parser("purge-pseudonyms", help="delete expired pseudonym map rows")
+    purge.add_argument("--site-id")
+
     return parser
 
 
@@ -230,6 +233,10 @@ def main(argv: list[str] | None = None) -> int:
             code = registry.issue_code(args.site_id, args.moodle_url, ttl)
             _write_once(args.out, code)
             print(f"issued code for site={args.site_id}")
+            return 0
+
+        if args.command == "purge-pseudonyms":
+            print(f"purged {registry.pmap_purge(args.site_id)}")
             return 0
     except (TenantError, OSError, ValueError, KekError) as exc:
         print(f"error: {exc}", file=sys.stderr)

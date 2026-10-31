@@ -124,7 +124,7 @@ def test_pseudonymize_flag_roundtrip(tmp_path):
     assert registry.get("site-b").pseudonymize is False
 
 
-def test_schema_v1_migrates_to_v3(tmp_path):
+def test_schema_v1_migrates_to_v4(tmp_path):
     db = tmp_path / "old.sqlite3"
     with sqlite3.connect(db) as conn:
         conn.executescript(
@@ -158,9 +158,14 @@ def test_schema_v1_migrates_to_v3(tmp_path):
     assert tenant is not None
     assert tenant.pseudonymize is True
     with sqlite3.connect(db) as conn:
-        assert conn.execute("SELECT schema_version FROM meta").fetchone()[0] == 3
+        assert conn.execute("SELECT schema_version FROM meta").fetchone()[0] == 4
         columns = {row[1] for row in conn.execute("PRAGMA table_info(tenants)")}
         assert "pseudonymize" in columns
+        tables = {
+            row[0]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        assert "pseudonym_map" in tables
 
 
 def test_registration_codes_are_atomic_and_expire(tmp_path):
@@ -173,3 +178,42 @@ def test_registration_codes_are_atomic_and_expire(tmp_path):
     assert registry.claim_code(expired, now + 120) is None
     unknown = registry.issue_code("site-a", "https://a.example", 60)
     assert registry.claim_code("not-" + unknown, now) is None
+
+
+def test_schema_v3_migrates_to_v4(tmp_path):
+    db = tmp_path / "v3.sqlite3"
+    with sqlite3.connect(db) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE meta (schema_version INTEGER NOT NULL);
+            CREATE TABLE tenants (
+              site_id      TEXT PRIMARY KEY,
+              moodle_url   TEXT NOT NULL,
+              token_ct     BLOB NOT NULL,
+              litellm_ct   BLOB,
+              bearer_hash  BLOB NOT NULL UNIQUE,
+              kek_id       TEXT NOT NULL,
+              status       TEXT NOT NULL DEFAULT 'active',
+              pseudonymize INTEGER NOT NULL DEFAULT 1,
+              created_at   INTEGER NOT NULL,
+              updated_at   INTEGER NOT NULL
+            );
+            CREATE TABLE reg_codes (
+              code_hash  BLOB PRIMARY KEY,
+              site_id    TEXT NOT NULL,
+              moodle_url TEXT NOT NULL,
+              expires_at INTEGER NOT NULL,
+              used_at    INTEGER
+            );
+            INSERT INTO meta(schema_version) VALUES (3);
+            """
+        )
+    registry = Registry.open(str(db), make_kek())
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT schema_version FROM meta").fetchone()[0] == 4
+        tables = {
+            row[0]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        assert "pseudonym_map" in tables
+    assert registry.kek_ids() == set()

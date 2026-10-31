@@ -99,3 +99,40 @@ def test_kek_repr_hides_material(tmp_path):
     assert raw.hex() not in text
     with pytest.raises(KekError):
         Kek(os.urandom(31))
+
+
+def test_derive_key_is_deterministic_and_tenant_specific():
+    from moodle_mcp.crypto import derive_key
+
+    kek = Kek(os.urandom(32))
+    first = derive_key(kek, "pseudonym-hmac", "site-a")
+    assert len(first) == 32
+    assert first == derive_key(kek, "pseudonym-hmac", "site-a")
+    assert first != derive_key(kek, "pseudonym-hmac", "site-b")
+    assert first != derive_key(kek, "pseudonym-map", "site-a")
+    assert first != kek._raw
+
+
+def test_derive_key_info_and_salt(monkeypatch):
+    from moodle_mcp import crypto
+
+    captured = {}
+
+    class FakeHKDF:
+        def __init__(self, *, algorithm, length, salt, info):
+            captured["algorithm"] = algorithm
+            captured["length"] = length
+            captured["salt"] = salt
+            captured["info"] = info
+
+        def derive(self, key_material):
+            captured["key_material"] = key_material
+            return b"x" * 32
+
+    monkeypatch.setattr(crypto, "HKDF", FakeHKDF)
+    kek = Kek(b"k" * 32)
+    assert crypto.derive_key(kek, "pseudonym-hmac", "test-local") == b"x" * 32
+    assert captured["info"] == b"pseudonym-hmac\x00test-local"
+    assert captured["salt"] == b"ubionai-hub/hkdf/v1"
+    assert captured["length"] == 32
+    assert captured["key_material"] == b"k" * 32
