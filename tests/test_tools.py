@@ -1,0 +1,171 @@
+import json
+
+import pytest
+import respx
+
+from moodle_mcp.moodle import MoodleClient
+from moodle_mcp.server import WRITE_NOTE, create_mcp
+
+from .conftest import ENDPOINT, MOODLE_TOKEN
+from .test_moodle import form
+
+BASE = {"wstoken": MOODLE_TOKEN, "moodlewsrestformat": "json"}
+
+
+@pytest.fixture
+def mcp():
+    return create_mcp(MoodleClient(ENDPOINT, MOODLE_TOKEN))
+
+
+async def run(mcp, name, args, response):
+    with respx.mock:
+        route = respx.post(ENDPOINT).respond(text=json.dumps(response))
+        _content, structured = await mcp.call_tool(name, args)
+        return structured, form(route.calls.last.request)
+
+
+CASES = [
+    ("site_info", {}, "core_webservice_get_site_info", {}),
+    ("list_courses", {}, "core_course_get_courses", {}),
+    ("list_courses", {"ids": [5, 6]}, "core_course_get_courses", {"options[ids][0]": "5", "options[ids][1]": "6"}),
+    ("get_course_outline", {"course_id": 5}, "core_course_get_contents", {"courseid": "5"}),
+    ("list_students", {"course_id": 5}, "core_enrol_get_enrolled_users", {"courseid": "5"}),
+    ("list_assignments", {}, "mod_assign_get_assignments", {}),
+    ("list_assignments", {"course_ids": [5]}, "mod_assign_get_assignments", {"courseids[0]": "5"}),
+    (
+        "get_submissions",
+        {"assignment_ids": [9, 10]},
+        "mod_assign_get_submissions",
+        {"assignmentids[0]": "9", "assignmentids[1]": "10", "status": ""},
+    ),
+    (
+        "get_submissions",
+        {"assignment_ids": [9], "status": "submitted"},
+        "mod_assign_get_submissions",
+        {"assignmentids[0]": "9", "status": "submitted"},
+    ),
+    ("gradebook_overview", {"course_id": 5}, "gradereport_user_get_grade_items", {"courseid": "5"}),
+    (
+        "gradebook_overview",
+        {"course_id": 5, "user_id": 3},
+        "gradereport_user_get_grade_items",
+        {"courseid": "5", "userid": "3"},
+    ),
+    ("list_quizzes", {"course_ids": [5]}, "mod_quiz_get_quizzes_by_courses", {"courseids[0]": "5"}),
+    (
+        "list_quiz_attempts",
+        {"quiz_id": 4, "user_id": 3},
+        "mod_quiz_get_user_attempts",
+        {"quizid": "4", "userid": "3", "status": "all", "includepreviews": "0"},
+    ),
+    ("review_attempt", {"attempt_id": 77}, "mod_quiz_get_attempt_review", {"attemptid": "77"}),
+    ("attendance_sessions", {"attendance_id": 8}, "mod_attendance_get_sessions", {"attendanceid": "8"}),
+    (
+        "grade_submission",
+        {"assignment_id": 9, "user_id": 3, "grade": 8.5, "feedback_text": "<p>Good</p>"},
+        "mod_assign_save_grade",
+        {
+            "assignmentid": "9",
+            "userid": "3",
+            "grade": "8.5",
+            "attemptnumber": "-1",
+            "addattempt": "0",
+            "workflowstate": "",
+            "applytoall": "1",
+            "plugindata[assignfeedbackcomments_editor][text]": "<p>Good</p>",
+            "plugindata[assignfeedbackcomments_editor][format]": "1",
+        },
+    ),
+    (
+        "grade_submission",
+        {"assignment_id": 9, "user_id": 3, "grade": 7, "attempt_number": 2, "workflow_state": "released"},
+        "mod_assign_save_grade",
+        {
+            "assignmentid": "9",
+            "userid": "3",
+            "grade": "7.0",
+            "attemptnumber": "2",
+            "addattempt": "0",
+            "workflowstate": "released",
+            "applytoall": "1",
+            "plugindata[assignfeedbackcomments_editor][text]": "",
+            "plugindata[assignfeedbackcomments_editor][format]": "1",
+        },
+    ),
+    (
+        "bulk_grade",
+        {
+            "assignment_id": 9,
+            "grades": [
+                {"user_id": 3, "grade": 8, "feedback_text": "ok"},
+                {"user_id": 4, "grade": 6.5},
+            ],
+        },
+        "mod_assign_save_grades",
+        {
+            "assignmentid": "9",
+            "applytoall": "1",
+            **{
+                f"grades[{i}][{k}]": v
+                for i, (uid, g, fb) in enumerate([("3", "8.0", "ok"), ("4", "6.5", "")])
+                for k, v in {
+                    "userid": uid,
+                    "grade": g,
+                    "attemptnumber": "-1",
+                    "addattempt": "0",
+                    "workflowstate": "",
+                    "plugindata][assignfeedbackcomments_editor][text": fb,
+                    "plugindata][assignfeedbackcomments_editor][format": "1",
+                }.items()
+            },
+        },
+    ),
+]
+
+
+@pytest.mark.parametrize(("tool", "args", "wsfunction", "params"), CASES)
+async def test_tool_calls_right_wsfunction(mcp, tool, args, wsfunction, params):
+    _, sent = await run(mcp, tool, args, {"ok": 1})
+    assert sent == {**BASE, "wsfunction": wsfunction, **params}
+
+
+async def test_list_results_are_wrapped(mcp):
+    result, _ = await run(mcp, "list_courses", {}, [{"id": 1}])
+    assert result == {"courses": [{"id": 1}]}
+    result, _ = await run(mcp, "list_students", {"course_id": 2}, [{"id": 3}])
+    assert result == {"users": [{"id": 3}]}
+
+
+async def test_dict_result_returned_as_is(mcp):
+    payload = {"sitename": "Demo", "userid": 2}
+    result, _ = await run(mcp, "site_info", {}, payload)
+    assert result == payload
+
+
+async def test_write_tools_report_ok(mcp):
+    result, _ = await run(mcp, "grade_submission", {"assignment_id": 1, "user_id": 2, "grade": 3}, None)
+    assert result == {"ok": True, "result": None}
+    result, _ = await run(mcp, "bulk_grade", {"assignment_id": 1, "grades": [{"user_id": 2, "grade": 3}]}, [])
+    assert result == {"ok": True, "graded": 1, "result": []}
+
+
+async def test_moodle_error_returns_error_dict(mcp):
+    err = {"exception": "moodle_exception", "errorcode": "invalidrecord", "message": "Can't find data record"}
+    for tool, args in [("site_info", {}), ("grade_submission", {"assignment_id": 1, "user_id": 2, "grade": 3})]:
+        result, _ = await run(mcp, tool, args, err)
+        assert set(result) == {"error"}
+        assert "invalidrecord" in result["error"]
+        assert MOODLE_TOKEN not in json.dumps(result)
+
+
+async def test_write_tools_are_marked(mcp):
+    tools = {t.name: t for t in await mcp.list_tools()}
+    assert set(tools) == {
+        "site_info", "list_courses", "get_course_outline", "list_students", "list_assignments",
+        "get_submissions", "gradebook_overview", "list_quizzes", "list_quiz_attempts", "review_attempt",
+        "attendance_sessions", "grade_submission", "bulk_grade",
+    }  # fmt: skip
+    for name in ("grade_submission", "bulk_grade"):
+        assert WRITE_NOTE in tools[name].description
+    for name in set(tools) - {"grade_submission", "bulk_grade"}:
+        assert "WRITE" not in (tools[name].description or "")

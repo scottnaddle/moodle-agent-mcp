@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "moodle-mcp"
+version = "0.1.0"
+description = "MCP server exposing Moodle REST web services (Streamable HTTP)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp>=1.26,<2",
+    "httpx>=0.27,<1",
+    "uvicorn>=0.30,<1",
+    "starlette>=0.40",
+    "pydantic>=2.7,<3",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "respx>=0.21",
+]
+
+[project.scripts]
+moodle-mcp = "moodle_mcp.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
