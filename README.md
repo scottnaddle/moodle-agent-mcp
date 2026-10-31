@@ -46,7 +46,7 @@ flowchart LR
 | 2 | `list_courses` | 읽기 | List courses. |
 | 3 | `get_course_outline` | 읽기 | Get the sections and activities/modules of a course. |
 | 4 | `list_students` | 읽기 | List users enrolled in a course (with roles and groups). |
-| 5 | `list_assignments` | 읽기 | List assignments, grouped by course. |
+| 5 | `list_assignments` | 읽기 | List assignments, grouped by course. Courses the service user is not enrolled in use the optional `local_ubionai_get_course_assignments` fallback and are tagged `source: local_ubionai`. |
 | 6 | `get_submissions` | 읽기 | Get submissions for assignments. |
 | 7 | `get_assignment_grades` | 읽기 | Get grades already given for assignments (mod_assign_get_grades). |
 | 8 | `gradebook_overview` | 읽기 | Get gradebook items and grades for a course, optionally for a single user. |

@@ -54,6 +54,27 @@ _NAME_LABELS = {
 }
 _NAME_FIELDS = {"firstname", "lastname", "fullname", "userfullname", "username"}
 _EMAIL_FIELDS = {"email", "emailaddress"}
+# Field-key masking only applies inside user-like objects. Courses, categories
+# and activities also have fullname/shortname fields that must stay readable.
+_USER_CONTAINER_KEYS = frozenset(
+    {"users", "participants", "members", "students", "author", "user"}
+)
+_USER_MARKER_KEYS = frozenset(
+    {"firstname", "lastname", "email", "emailaddress", "username", "idnumber", "userid"}
+)
+# Names of non-user objects (courses, categories, activities) are kept as-is,
+# including from heuristic name detection, unless the object is user-like.
+_PLAIN_OBJECT_FIELDS = frozenset({"fullname", "shortname"})
+
+
+def _looks_like_user(value: object) -> bool:
+    return isinstance(value, dict) and any(
+        isinstance(key, str) and key.lower() in _USER_MARKER_KEYS for key in value
+    )
+
+
+def _is_user_container_key(key: object) -> bool:
+    return isinstance(key, str) and key.lower() in _USER_CONTAINER_KEYS
 
 # Particles/endings and titles that may directly follow a Korean name. They are
 # kept in the text while the name itself is replaced. Longest first so "입니다"
@@ -455,49 +476,80 @@ class Pseudonymizer:
             if len(part) >= 2:
                 self.add_known(part)
 
-    def _seed_from(self, value: object, name_keys: frozenset[str] = frozenset()) -> None:
+    def _seed_from(
+        self,
+        value: object,
+        name_keys: frozenset[str] = frozenset(),
+        user_like: bool = False,
+    ) -> None:
         if isinstance(value, dict):
+            is_user = user_like or _looks_like_user(value)
             lowered: dict[str, object] = {}
             for key, item in value.items():
                 if not isinstance(key, str):
                     continue
                 lowered[key.lower()] = item
-                if isinstance(item, str) and _field_category(key, name_keys) == "name":
+                if (
+                    is_user
+                    and isinstance(item, str)
+                    and _field_category(key, name_keys) == "name"
+                ):
                     self._seed_name(item)
-                self._seed_from(item, name_keys)
-            last = lowered.get("lastname")
-            first = lowered.get("firstname")
-            if isinstance(last, str) and isinstance(first, str):
-                self._seed_name(last + first)
-                self._seed_name(last + " " + first)
-                self._seed_name(first + last)
-                self._seed_name(first + " " + last)
-            for key in ("fullname", "userfullname"):
-                full = lowered.get(key)
-                if isinstance(full, str):
-                    self._seed_name(full)
+                self._seed_from(
+                    item, name_keys, is_user or _is_user_container_key(key)
+                )
+            if is_user:
+                last = lowered.get("lastname")
+                first = lowered.get("firstname")
+                if isinstance(last, str) and isinstance(first, str):
+                    self._seed_name(last + first)
+                    self._seed_name(last + " " + first)
+                    self._seed_name(first + last)
+                    self._seed_name(first + " " + last)
+                for key in ("fullname", "userfullname"):
+                    full = lowered.get(key)
+                    if isinstance(full, str):
+                        self._seed_name(full)
         elif isinstance(value, (list, tuple)):
             for item in value:
-                self._seed_from(item, name_keys)
+                self._seed_from(item, name_keys, user_like)
 
-    def _transform(self, value: object, key: str | None = None, name_keys: frozenset[str] = frozenset()) -> object:
+    def _transform(
+        self,
+        value: object,
+        key: str | None = None,
+        name_keys: frozenset[str] = frozenset(),
+        user_like: bool = False,
+    ) -> object:
         if isinstance(value, dict):
+            is_user = user_like or _looks_like_user(value)
             out: dict[object, object] = {}
             for item_key, item in value.items():
                 new_key = self.pseudonymize(item_key) if isinstance(item_key, str) else item_key
-                out[new_key] = self._transform(item, item_key, name_keys)
+                out[new_key] = self._transform(
+                    item,
+                    item_key,
+                    name_keys,
+                    is_user or _is_user_container_key(item_key),
+                )
             return out
         if isinstance(value, (list, tuple)):
-            return [self._transform(item, key=None, name_keys=name_keys) for item in value]
+            return [
+                self._transform(item, key=None, name_keys=name_keys, user_like=user_like)
+                for item in value
+            ]
         if isinstance(value, str):
-            category = _field_category(key, name_keys)
-            if category is not None:
-                return self._allocate(category, value)
+            if user_like:
+                category = _field_category(key, name_keys)
+                if category is not None:
+                    return self._allocate(category, value)
+            elif isinstance(key, str) and key.lower() in _PLAIN_OBJECT_FIELDS:
+                return value
             return self.pseudonymize(value)
         if isinstance(value, bool):
             return value
         if isinstance(value, (int, float)):
-            category = _field_category(key, name_keys)
+            category = _field_category(key, name_keys) if user_like else None
             if category is not None:
                 return self._allocate(category, str(value))
         return value
