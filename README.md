@@ -2,6 +2,12 @@
 
 > 우리 Moodle에 **AI 에이전트(Grok Bot 등 MCP 클라이언트)**를 붙여서 강좌 조회·생성·채점까지 바로 쓸 수 있게 해 주는 키트입니다. COURSEMOS팀 공유용. 토큰·비밀값·실서버 주소는 들어 있지 않아요.
 
+## 데모 영상
+
+[![AI 에이전트가 무들 강좌를 만드는 과정](https://img.youtube.com/vi/3HzwHaY5cY8/hqdefault.jpg)](https://youtu.be/3HzwHaY5cY8)
+
+교수자의 한 줄 요청으로 에이전트가 MCP 도구 13번 호출만으로 강좌(4주차·읽기자료·과제·퀴즈·이수 조건)를 만드는 81초 영상이에요. [YouTube에서 보기](https://youtu.be/3HzwHaY5cY8)
+
 ## 들어 있는 것
 | 경로 | 내용 |
 |---|---|
