@@ -9,21 +9,40 @@ import re
 import secrets
 import sqlite3
 import time
+import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Iterator
 from urllib.parse import urlsplit, urlunsplit
 
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
 from .crypto import (
     FIELD_LITELLM_KEY,
     FIELD_MOODLE_TOKEN,
+    PURPOSE_PSEUDONYM_MAP,
     DecryptError,
     Kek,
+    derive_key,
     open_,
     seal,
 )
 
 SITE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
+
+
+def _parse_pseudonym_ttl() -> int:
+    try:
+        return int(os.environ.get("UBIONAI_HUB_PSEUDONYM_TTL", "86400"))
+    except ValueError:
+        return 86_400
+
+
+PSEUDONYM_TTL = _parse_pseudonym_ttl()
+
+_PMAP_AAD_PREFIX = b"ubionai-hub/pmap/v1\x00"
+_PMAP_NONCE_LEN = 12
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -51,7 +70,16 @@ CREATE TABLE IF NOT EXISTS reg_codes (
   expires_at INTEGER NOT NULL,
   used_at    INTEGER
 );
-INSERT INTO meta(schema_version) SELECT 3 WHERE NOT EXISTS (SELECT 1 FROM meta);
+CREATE TABLE IF NOT EXISTS pseudonym_map (
+  site_id     TEXT NOT NULL,
+  placeholder TEXT NOT NULL,
+  category    TEXT NOT NULL,
+  value_ct    BLOB NOT NULL,
+  kek_id      TEXT NOT NULL,
+  expires_at  INTEGER NOT NULL,
+  PRIMARY KEY (site_id, placeholder)
+);
+INSERT INTO meta(schema_version) SELECT 4 WHERE NOT EXISTS (SELECT 1 FROM meta);
 """
 
 
@@ -121,10 +149,20 @@ def _now() -> int:
     return int(time.time())
 
 
+def _normalize_original(category: str, original: str) -> str:
+    text = unicodedata.normalize("NFC", original).strip()
+    if category == "email":
+        return text.lower()
+    if category in ("phone", "resident_id"):
+        return re.sub(r"[- ]", "", text)
+    return text
+
+
 class Registry:
     def __init__(self, db_path: str, kek: Kek) -> None:
         self._path = db_path
         self._kek = kek
+        self._last_purge = 0.0
 
     @classmethod
     def open(cls, db_path: str, kek: Kek) -> "Registry":
@@ -143,10 +181,13 @@ class Registry:
                 )
             row = conn.execute("SELECT schema_version FROM meta").fetchone()
             if row is None:
-                conn.execute("INSERT INTO meta(schema_version) VALUES (3)")
-            elif row[0] < 3:
-                registry._migrate_aad(conn)
-                conn.execute("UPDATE meta SET schema_version = 3")
+                conn.execute("INSERT INTO meta(schema_version) VALUES (4)")
+            else:
+                if row[0] < 3:
+                    registry._migrate_aad(conn)
+                    conn.execute("UPDATE meta SET schema_version = 3")
+                if row[0] < 4:
+                    conn.execute("UPDATE meta SET schema_version = 4")
         return registry
 
     def _migrate_aad(self, conn: sqlite3.Connection) -> None:
@@ -309,8 +350,159 @@ class Registry:
     def rotate_pseudonymize(self, site_id: str, enabled: bool) -> None:
         self._update(site_id, "pseudonymize = ?, updated_at = ?", (int(enabled), _now()))
 
+    def _pmap_aad(self, site_id: str, placeholder: str) -> bytes:
+        return (
+            _PMAP_AAD_PREFIX
+            + site_id.encode("utf-8")
+            + b"\x00"
+            + placeholder.encode("utf-8")
+        )
+
+    def _pmap_encrypt(self, site_id: str, placeholder: str, original: str) -> bytes:
+        nonce = os.urandom(_PMAP_NONCE_LEN)
+        key = derive_key(self._kek, PURPOSE_PSEUDONYM_MAP, site_id)
+        ciphertext = AESGCM(key).encrypt(
+            nonce, original.encode("utf-8"), self._pmap_aad(site_id, placeholder)
+        )
+        return nonce + ciphertext
+
+    def _pmap_decrypt(self, site_id: str, placeholder: str, blob: bytes) -> str | None:
+        try:
+            nonce = blob[:_PMAP_NONCE_LEN]
+            ciphertext = blob[_PMAP_NONCE_LEN:]
+            key = derive_key(self._kek, PURPOSE_PSEUDONYM_MAP, site_id)
+            plaintext = AESGCM(key).decrypt(
+                nonce, ciphertext, self._pmap_aad(site_id, placeholder)
+            )
+            return plaintext.decode("utf-8")
+        except (InvalidTag, ValueError, UnicodeDecodeError, TypeError):
+            return None
+
+    def pmap_get(
+        self, site_id: str, placeholder: str, now: int, ttl: int | None = None
+    ) -> tuple[str, str] | None:
+        now = int(now)
+        ttl = PSEUDONYM_TTL if ttl is None else int(ttl)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT category, value_ct, kek_id, expires_at FROM pseudonym_map"
+                " WHERE site_id = ? AND placeholder = ?",
+                (site_id, placeholder),
+            ).fetchone()
+            if row is None:
+                return None
+            category, blob, kek_id, expires_at = row
+            if kek_id != self._kek.kek_id:
+                conn.execute(
+                    "DELETE FROM pseudonym_map WHERE site_id = ? AND placeholder = ?",
+                    (site_id, placeholder),
+                )
+                return None
+            if expires_at <= now:
+                return None
+            original = self._pmap_decrypt(site_id, placeholder, blob)
+            if original is None:
+                return None
+            conn.execute(
+                "UPDATE pseudonym_map SET expires_at = ?"
+                " WHERE site_id = ? AND placeholder = ?",
+                (now + ttl, site_id, placeholder),
+            )
+        return category, original
+
+    def pmap_put(
+        self,
+        site_id: str,
+        placeholder: str,
+        category: str,
+        original: str,
+        ttl: int,
+        now: int,
+    ) -> None:
+        now = int(now)
+        ttl = int(ttl)
+        monotonic_now = time.monotonic()
+        if monotonic_now - self._last_purge >= 60:
+            self._last_purge = monotonic_now
+            self.pmap_purge(now=now)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT category, value_ct, kek_id, expires_at FROM pseudonym_map"
+                " WHERE site_id = ? AND placeholder = ?",
+                (site_id, placeholder),
+            ).fetchone()
+            if row is not None:
+                existing_category, blob, kek_id, expires_at = row
+                if expires_at > now and kek_id == self._kek.kek_id:
+                    existing = self._pmap_decrypt(site_id, placeholder, blob)
+                    if existing is not None:
+                        if _normalize_original(category, existing) != _normalize_original(
+                            category, original
+                        ):
+                            conn.execute(
+                                "UPDATE pseudonym_map SET expires_at = ?"
+                                " WHERE site_id = ? AND placeholder = ?",
+                                (now + ttl, site_id, placeholder),
+                            )
+                            return
+                        conn.execute(
+                            "UPDATE pseudonym_map SET expires_at = ?"
+                            " WHERE site_id = ? AND placeholder = ?",
+                            (now + ttl, site_id, placeholder),
+                        )
+                        return
+            value_ct = self._pmap_encrypt(site_id, placeholder, original)
+            conn.execute(
+                "INSERT INTO pseudonym_map"
+                " (site_id, placeholder, category, value_ct, kek_id, expires_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(site_id, placeholder) DO UPDATE SET"
+                " category = excluded.category, value_ct = excluded.value_ct,"
+                " kek_id = excluded.kek_id, expires_at = excluded.expires_at",
+                (site_id, placeholder, category, value_ct, self._kek.kek_id, now + ttl),
+            )
+
+    def pmap_norm(self, site_id: str, placeholder: str, now: int) -> str | None:
+        now = int(now)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT category, value_ct, kek_id, expires_at FROM pseudonym_map"
+                " WHERE site_id = ? AND placeholder = ?",
+                (site_id, placeholder),
+            ).fetchone()
+            if row is None:
+                return None
+            category, blob, kek_id, expires_at = row
+            if kek_id != self._kek.kek_id:
+                conn.execute(
+                    "DELETE FROM pseudonym_map WHERE site_id = ? AND placeholder = ?",
+                    (site_id, placeholder),
+                )
+                return None
+            if expires_at <= now:
+                return None
+            original = self._pmap_decrypt(site_id, placeholder, blob)
+            if original is None:
+                return None
+        return _normalize_original(category, original)
+
+    def pmap_purge(self, site_id: str | None = None, now: int | None = None) -> int:
+        now = _now() if now is None else int(now)
+        with self._connect() as conn:
+            if site_id is None:
+                cur = conn.execute(
+                    "DELETE FROM pseudonym_map WHERE expires_at <= ?", (now,)
+                )
+            else:
+                cur = conn.execute(
+                    "DELETE FROM pseudonym_map WHERE site_id = ? AND expires_at <= ?",
+                    (site_id, now),
+                )
+            return cur.rowcount
+
     def delete(self, site_id: str) -> None:
         with self._connect() as conn:
+            conn.execute("DELETE FROM pseudonym_map WHERE site_id = ?", (site_id,))
             cur = conn.execute("DELETE FROM tenants WHERE site_id = ?", (site_id,))
             if cur.rowcount == 0:
                 raise TenantNotFound("site not found")

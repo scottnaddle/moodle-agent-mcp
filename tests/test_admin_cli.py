@@ -5,6 +5,7 @@ import json
 import os
 import re
 import stat
+import time
 
 import pytest
 
@@ -178,3 +179,22 @@ def test_errors_do_not_echo_secrets(admin_env, capsys):
     captured = capsys.readouterr()
     assert "SUPERSECRET-TOKEN" not in captured.out
     assert "SUPERSECRET-TOKEN" not in captured.err
+
+
+def test_purge_pseudonyms_counts_and_site_filter(admin_env, capsys):
+    _, db, kek_file = admin_env
+    registry = Registry.open(str(db), load_kek(kek_file))
+    now = int(time.time())
+    registry.pmap_put("site-a", "[이름_deadbeef]", "name", "김민수", 1, 0)
+    registry.pmap_put("site-a", "[이름_feedface]", "name", "홍길동", 1, 0)
+    registry.pmap_put("site-b", "[이름_cafebabe]", "name", "이영희", 1, 0)
+    registry.pmap_put("site-a", "[이름_00000000]", "name", "박지성", 3600, now)
+    capsys.readouterr()
+
+    assert main(["purge-pseudonyms", "--site-id", "site-a"]) == 0
+    output = capsys.readouterr().out
+    assert output.strip() == "purged 2"
+    assert "김민수" not in output and "홍길동" not in output
+
+    assert main(["purge-pseudonyms"]) == 0
+    assert capsys.readouterr().out.strip() == "purged 1"

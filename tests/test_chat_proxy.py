@@ -2,6 +2,7 @@ import base64
 import json
 import logging
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
@@ -15,6 +16,8 @@ from moodle_mcp.server import create_app
 
 LITELLM_URL = "https://litellm.test"
 CHAT = "/t/{site}/v1/chat/completions"
+PLACEHOLDER_RE = re.compile(r"\[(?:이름|학번|이메일|전화번호|주민번호)_[0-9a-f]{8}\]")
+MCP_ENDPOINT = "https://moodle2.test/webservice/rest/server.php"
 
 
 def write_kek(path):
@@ -35,6 +38,9 @@ def proxy(tmp_path, monkeypatch):
     registry.add("test2", "https://moodle2.test", b"wstoken-2", b"site-test2", "bearer-2")
     registry.add("test3", "https://moodle3.test", b"wstoken-3", b"site-test3", "bearer-3")
     registry.add("nokey", "https://moodle4.test", b"wstoken-4", None, "bearer-4")
+    registry.add(
+        "plain", "https://moodle5.test", b"wstoken-5", b"site-plain", "bearer-5", pseudonymize=False
+    )
     app = create_app(hub_db=str(db), kek_file=str(kek_file))
     with TestClient(app, base_url="http://hub.test") as client:
         yield client, registry
@@ -53,24 +59,30 @@ def chat_payload(text="학생 김철수 학번 2023123456", **extra):
 
 def test_happy_path_pseudonymizes_forward_and_restores_response(proxy):
     client, _ = proxy
-    with respx.mock as router:
-        route = router.post(f"{LITELLM_URL}/v1/chat/completions").mock(
-            return_value=httpx.Response(
-                200,
-                json={
-                    "id": "x",
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": "[이름_1] 학생의 학번은 [학번_1]입니다.",
-                            },
-                        }
-                    ],
-                },
-            )
+
+    def upstream(request):
+        forwarded = json.loads(request.content)
+        text = forwarded["messages"][0]["content"]
+        placeholders = PLACEHOLDER_RE.findall(text)
+        assert len(placeholders) == 2
+        return httpx.Response(
+            200,
+            json={
+                "id": "x",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": f"{placeholders[0]} 학생의 학번은 {placeholders[1]}입니다.",
+                        },
+                    }
+                ],
+            },
         )
+
+    with respx.mock as router:
+        route = router.post(f"{LITELLM_URL}/v1/chat/completions").mock(side_effect=upstream)
         response = client.post(
             CHAT.format(site="test2"), json=chat_payload(), headers=headers("bearer-2")
         )
@@ -80,8 +92,7 @@ def test_happy_path_pseudonymizes_forward_and_restores_response(proxy):
         assert forwarded["model"] == "gpt-test"
         assert "김철수" not in forwarded_text
         assert "2023123456" not in forwarded_text
-        assert "[이름_1]" in forwarded_text
-        assert "[학번_1]" in forwarded_text
+        assert len(PLACEHOLDER_RE.findall(forwarded_text)) == 2
         assert route.calls.last.request.headers["authorization"] == "Bearer site-test2"
         assert "김철수" in response.json()["choices"][0]["message"]["content"]
         assert "2023123456" in response.json()["choices"][0]["message"]["content"]
@@ -111,8 +122,8 @@ def test_content_parts_are_pseudonymized(proxy):
         assert response.status_code == 200, response.text
         forwarded = json.loads(route.calls.last.request.content)
         parts = forwarded["messages"][0]["content"]
-        assert parts[0]["text"].startswith("[이름_1]")
-        assert parts[1]["text"].startswith("[이름_2]")
+        assert PLACEHOLDER_RE.match(parts[0]["text"])
+        assert PLACEHOLDER_RE.match(parts[1]["text"])
         assert "2023123456" not in json.dumps(forwarded, ensure_ascii=False)
 
 
@@ -165,20 +176,19 @@ def test_stream_is_forced_off(proxy):
         assert response.headers["content-type"].startswith("application/json")
 
 
-def test_upstream_error_status_and_restore(proxy):
+def test_upstream_error_body_is_passed_through(proxy):
     client, _ = proxy
     with respx.mock as router:
         router.post(f"{LITELLM_URL}/v1/chat/completions").respond(
             status_code=429,
-            json={"error": {"message": "rate limited [이름_1] / [학번_1]"}},
+            json={"error": {"message": "rate limited [이름_deadbeef] / [학번_deadbeef]"}},
         )
         response = client.post(
             CHAT.format(site="test2"), json=chat_payload(), headers=headers("bearer-2")
         )
         assert response.status_code == 429
         text = response.json()["error"]["message"]
-        assert "김철수" in text
-        assert "2023123456" in text
+        assert text == "rate limited [이름_deadbeef] / [학번_deadbeef]"
 
 
 def test_bad_body_and_oversize(proxy):
@@ -207,8 +217,11 @@ def test_interleaved_tenants_keep_independent_maps(proxy):
         name = "김철수" if key == "site-test2" else "홍길동"
         request_body = json.loads(request.content)
         assert name not in json.dumps(request_body, ensure_ascii=False)
-        assert "[이름_1]" in json.dumps(request_body, ensure_ascii=False)
-        return httpx.Response(200, json={"choices": [{"message": {"content": "[이름_1]"}}]})
+        match = PLACEHOLDER_RE.search(json.dumps(request_body, ensure_ascii=False))
+        assert match is not None
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": match.group(0)}}]}
+        )
 
     with respx.mock as router:
         router.post(f"{LITELLM_URL}/v1/chat/completions").mock(side_effect=upstream)
@@ -248,3 +261,163 @@ def test_no_secrets_or_pii_in_logs(proxy, caplog, capsys):
     combined = caplog.text + captured.out + captured.err
     for secret in ("site-test2", "bearer-2", "김철수", "2023123456"):
         assert secret not in combined
+
+
+MCP_HEADERS = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
+
+
+def mcp_call(client, site, bearer, name, arguments, request_id=2):
+    return client.post(
+        f"/t/{site}/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        },
+        headers={**MCP_HEADERS, "Authorization": f"Bearer {bearer}"},
+    )
+
+
+def test_chat_requests_reuse_stable_placeholder(proxy):
+    client, _ = proxy
+    seen = []
+
+    def upstream(request):
+        forwarded = json.loads(request.content)
+        text = forwarded["messages"][0]["content"]
+        seen.append(text)
+        assert "김민수" not in text
+        return httpx.Response(200, json={"choices": [{"message": {"content": text}}]})
+
+    with respx.mock as router:
+        router.post(f"{LITELLM_URL}/v1/chat/completions").mock(side_effect=upstream)
+        for _ in range(2):
+            response = client.post(
+                CHAT.format(site="test2"),
+                json=chat_payload(text="김민수 학생"),
+                headers=headers("bearer-2"),
+            )
+            assert response.status_code == 200, response.text
+            assert "김민수" in response.json()["choices"][0]["message"]["content"]
+    assert seen[0] == seen[1]
+    assert PLACEHOLDER_RE.search(seen[0])
+
+
+def test_tool_call_arguments_are_restored_as_json(proxy):
+    client, _ = proxy
+    captured = {}
+
+    def first_upstream(request):
+        forwarded = json.loads(request.content)
+        captured["placeholder"] = PLACEHOLDER_RE.search(
+            forwarded["messages"][0]["content"]
+        ).group(0)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    with respx.mock as router:
+        router.post(f"{LITELLM_URL}/v1/chat/completions").mock(side_effect=first_upstream)
+        assert client.post(
+            CHAT.format(site="test2"),
+            json=chat_payload(text="김민수 학생"),
+            headers=headers("bearer-2"),
+        ).status_code == 200
+
+    placeholder = captured["placeholder"]
+    arguments = json.dumps(
+        {"feedback_text": f"{placeholder} 학생 수고했어요"}, ensure_ascii=False
+    )
+    broken = f"not-json {placeholder}"
+    with respx.mock as router:
+        router.post(f"{LITELLM_URL}/v1/chat/completions").respond(
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "type": "function",
+                                    "function": {"name": "f", "arguments": arguments},
+                                },
+                                {
+                                    "type": "function",
+                                    "function": {"name": "g", "arguments": broken},
+                                },
+                            ],
+                        }
+                    }
+                ]
+            }
+        )
+        response = client.post(
+            CHAT.format(site="test2"), json=chat_payload(), headers=headers("bearer-2")
+        )
+    calls = response.json()["choices"][0]["message"]["tool_calls"]
+    restored = json.loads(calls[0]["function"]["arguments"])
+    assert restored == {"feedback_text": "김민수 학생 수고했어요"}
+    assert calls[1]["function"]["arguments"] == broken
+
+
+def test_mcp_and_chat_share_the_same_map(proxy):
+    client, _ = proxy
+    with respx.mock as router:
+        router.post(MCP_ENDPOINT).respond(json=[{"id": 7, "fullname": "김민수"}])
+        listing = mcp_call(client, "test2", "bearer-2", "list_students", {"course_id": 5})
+        assert listing.status_code == 200, listing.text
+        placeholder = PLACEHOLDER_RE.search(listing.text).group(0)
+
+    with respx.mock as router:
+        router.post(f"{LITELLM_URL}/v1/chat/completions").respond(
+            json={"choices": [{"message": {"content": placeholder}}]}
+        )
+        response = client.post(
+            CHAT.format(site="test2"), json=chat_payload(text="안녕"), headers=headers("bearer-2")
+        )
+    assert response.json()["choices"][0]["message"]["content"] == "김민수"
+
+    captured = {}
+
+    def chat_upstream(request):
+        forwarded = json.loads(request.content)
+        captured["placeholder"] = PLACEHOLDER_RE.search(
+            forwarded["messages"][0]["content"]
+        ).group(0)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    with respx.mock as router:
+        router.post(f"{LITELLM_URL}/v1/chat/completions").mock(side_effect=chat_upstream)
+        assert client.post(
+            CHAT.format(site="test2"),
+            json=chat_payload(text="박지성 학생"),
+            headers=headers("bearer-2"),
+        ).status_code == 200
+    chat_placeholder = captured["placeholder"]
+
+    with respx.mock as router:
+        router.post(MCP_ENDPOINT).respond(json=[{"id": 8, "fullname": "박지성"}])
+        listing = mcp_call(
+            client, "test2", "bearer-2", "list_students", {"course_id": 5}, request_id=3
+        )
+    assert chat_placeholder in listing.text
+    assert "박지성" not in listing.text
+
+
+def test_pseudonymize_off_passes_through(proxy):
+    client, _ = proxy
+    text = "김민수 학번 20231234"
+
+    def upstream(request):
+        forwarded = json.loads(request.content)
+        assert forwarded["messages"][0]["content"] == text
+        return httpx.Response(200, json={"choices": [{"message": {"content": text}}]})
+
+    with respx.mock as router:
+        router.post(f"{LITELLM_URL}/v1/chat/completions").mock(side_effect=upstream)
+        response = client.post(
+            CHAT.format(site="plain"),
+            json=chat_payload(text=text),
+            headers=headers("bearer-5"),
+        )
+    assert response.status_code == 200, response.text
+    assert response.json()["choices"][0]["message"]["content"] == text

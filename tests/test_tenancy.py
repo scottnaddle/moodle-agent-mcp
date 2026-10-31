@@ -1,6 +1,7 @@
 import base64
 import logging
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -23,6 +24,7 @@ INIT = {
         "clientInfo": {"name": "test", "version": "0"},
     },
 }
+PLACEHOLDER_RE = re.compile(r"\[(?:이름|학번|이메일|전화번호|주민번호)_[0-9a-f]{8}\]")
 TOOL_CALL = {
     "jsonrpc": "2.0",
     "id": 2,
@@ -144,7 +146,7 @@ def test_tool_outputs_are_pseudonymized(multi):
     assert response.status_code == 200, response.text
     body = response.text
     assert "김철수" not in body
-    assert "[이름_1]" in body
+    assert PLACEHOLDER_RE.search(body)
 
 
 def test_tool_outputs_not_pseudonymized_when_flag_is_off(multi):
@@ -162,7 +164,7 @@ def test_tool_outputs_not_pseudonymized_when_flag_is_off(multi):
         response = client.post("/t/cc/mcp", json=TOOL_CALL, headers=headers("bearer-c"))
     assert response.status_code == 200, response.text
     assert "김철수" in response.text
-    assert "[이름_1]" not in response.text
+    assert not PLACEHOLDER_RE.search(response.text)
 
 
 def test_tool_output_mapping_is_per_request(multi):
@@ -189,7 +191,7 @@ def test_tool_output_mapping_is_per_request(multi):
         for name, status, text in results:
             assert status == 200
             assert name not in text
-            assert "[이름_1]" in text
+            assert PLACEHOLDER_RE.search(text)
 
 
 def test_concurrent_calls_are_isolated(multi):

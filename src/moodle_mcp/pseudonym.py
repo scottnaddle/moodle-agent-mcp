@@ -1,21 +1,42 @@
 """Reversible Korean PII pseudonymization for hub-mode requests.
 
-A :class:`Pseudonymizer` keeps a bidirectional mapping between originals and
-placeholders such as ``[이름_1]``, ``[학번_1]`` and ``[이메일_1]``. The mapping is
-only kept in process memory; it is never logged or persisted.
-
-Known tradeoff: if the original text already contains a literal string that
-looks like an allocated placeholder (for example ``[이름_1]``), it collides with
-the generated placeholder. It is not escaped.
+A :class:`Pseudonymizer` maps originals to deterministic placeholders such as
+``[이름_3fa9c1d2]``. In hub mode the mapping is stored encrypted in the tenant
+registry; single-tenant and unit-test use falls back to an in-process store.
+Mappings and key material are never logged.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import logging
+import os
 import re
 import threading
+import time
+import unicodedata
+from collections import OrderedDict
 from collections.abc import Iterable
 from functools import lru_cache
+from typing import TYPE_CHECKING, Protocol
+
+from .crypto import (
+    PURPOSE_PSEUDONYM_HMAC,
+    PURPOSE_PSEUDONYM_MAP,
+    Kek,
+    derive_key,
+)
+from .registry import PSEUDONYM_TTL
+
+if TYPE_CHECKING:
+    from .registry import Registry
+
+logger = logging.getLogger(__name__)
+
+_COLLISION_COUNT = 0
+_CACHE_MAX = 4096
 
 _SINGLE_SURNAMES = (
     "김이박최정강조윤장임한오서신권황안송류유홍전고문양손배백허남심노하곽성차주우구"
@@ -249,16 +270,163 @@ def _field_category(key: str | None, name_keys: frozenset[str] = frozenset()) ->
     return None
 
 
+PLACEHOLDER_RE = re.compile(r"\[(이름|학번|이메일|전화번호|주민번호)_[0-9a-f]{8}\]")
+LOOKALIKE_RE = re.compile(
+    r"\[(이름|학번|이메일|전화번호|주민번호)_[^\]\s]{1,64}\]"
+)
+
+
+def norm(category: str, original: str) -> str:
+    """Normalize an original for HMAC input and collision comparison."""
+    text = unicodedata.normalize("NFC", original).strip()
+    if category == "email":
+        return text.lower()
+    if category in ("phone", "resident_id"):
+        return re.sub(r"[- ]", "", text)
+    return text
+
+
+class PseudonymMap(Protocol):
+    def allocate(
+        self, category: str, original: str, placeholder: str | None = None
+    ) -> str | None: ...
+
+    def lookup(self, placeholder: str) -> str | None: ...
+
+
+class _MemoryPseudonymMap:
+    """In-process map used in single-tenant mode and by unit tests."""
+
+    def __init__(self) -> None:
+        self._items: dict[str, tuple[str, str]] = {}
+        self._ambiguous: set[str] = set()
+        self._lock = threading.RLock()
+
+    def allocate(
+        self, category: str, original: str, placeholder: str | None = None
+    ) -> str | None:
+        if placeholder is None:
+            raise TypeError("placeholder is required")
+        with self._lock:
+            if placeholder in self._ambiguous:
+                return None
+            item = self._items.get(placeholder)
+            if item is not None and norm(item[0], item[1]) != norm(category, original):
+                self._ambiguous.add(placeholder)
+                return None
+            if item is None:
+                self._items[placeholder] = (category, original)
+            return placeholder
+
+    def lookup(self, placeholder: str) -> str | None:
+        with self._lock:
+            if placeholder in self._ambiguous:
+                return None
+            item = self._items.get(placeholder)
+            return item[1] if item is not None else None
+
+
+class RegistryPseudonymMap:
+    """Encrypted, shared reverse map backed by a :class:`Registry`."""
+
+    def __init__(
+        self,
+        registry: "Registry",
+        site_id: str,
+        kek: Kek,
+        ttl: int = PSEUDONYM_TTL,
+    ) -> None:
+        self._registry = registry
+        self._site_id = site_id
+        self._ttl = int(ttl)
+        self._key = derive_key(kek, PURPOSE_PSEUDONYM_MAP, site_id)
+        self._hmac_key = derive_key(kek, PURPOSE_PSEUDONYM_HMAC, site_id)
+        self._ambiguous: set[str] = set()
+        self._cache: OrderedDict[str, tuple[str, float]] = OrderedDict()
+        self._lock = threading.RLock()
+
+    def _cache_get(self, placeholder: str) -> str | None:
+        with self._lock:
+            item = self._cache.get(placeholder)
+            if item is None:
+                return None
+            original, expires_at = item
+            if expires_at <= time.time():
+                del self._cache[placeholder]
+                return None
+            self._cache.move_to_end(placeholder)
+            return original
+
+    def _cache_put(self, placeholder: str, original: str) -> None:
+        with self._lock:
+            self._cache[placeholder] = (original, time.time() + self._ttl)
+            self._cache.move_to_end(placeholder)
+            while len(self._cache) > _CACHE_MAX:
+                self._cache.popitem(last=False)
+
+    def _cache_drop(self, placeholder: str) -> None:
+        with self._lock:
+            self._cache.pop(placeholder, None)
+
+    def allocate(
+        self, category: str, original: str, placeholder: str | None = None
+    ) -> str | None:
+        global _COLLISION_COUNT
+        if placeholder is None:
+            message = category.encode("utf-8") + b"\x00" + norm(
+                category, original
+            ).encode("utf-8")
+            digest = hmac.new(self._hmac_key, message, hashlib.sha256).hexdigest()[:8]
+            placeholder = f"[{_NAME_LABELS[category]}_{digest}]"
+        with self._lock:
+            if placeholder in self._ambiguous:
+                return None
+            now = int(time.time())
+            existing = self._registry.pmap_norm(self._site_id, placeholder, now)
+            if existing is not None and existing != norm(category, original):
+                self._ambiguous.add(placeholder)
+                self._cache_drop(placeholder)
+                _COLLISION_COUNT += 1
+                logger.warning("pseudonym collision site=%s", self._site_id)
+                return None
+            self._registry.pmap_put(
+                self._site_id, placeholder, category, original, self._ttl, now
+            )
+            row = self._registry.pmap_get(
+                self._site_id, placeholder, now, ttl=self._ttl
+            )
+            self._cache_put(placeholder, row[1] if row is not None else original)
+            return placeholder
+
+    def lookup(self, placeholder: str) -> str | None:
+        with self._lock:
+            if placeholder in self._ambiguous:
+                return None
+            cached = self._cache_get(placeholder)
+            if cached is not None:
+                return cached
+            row = self._registry.pmap_get(
+                self._site_id, placeholder, int(time.time()), ttl=self._ttl
+            )
+            if row is None:
+                return None
+            original = row[1]
+            self._cache_put(placeholder, original)
+            return original
+
+
 class Pseudonymizer:
     """Reversible pseudonymizer for Korean names, ids, emails and phone numbers."""
 
-    def __init__(self, known_names: Iterable[str] = ()) -> None:
+    def __init__(
+        self,
+        hmac_key: bytes | None = None,
+        store: PseudonymMap | None = None,
+        known_names: Iterable[str] = (),
+    ) -> None:
+        self._key = bytes(hmac_key) if hmac_key is not None else os.urandom(32)
+        self._store: PseudonymMap = store if store is not None else _MemoryPseudonymMap()
         self._known: set[str] = set()
-        self._forward: dict[str, dict[str, str]] = {
-            category: {} for category in _NAME_LABELS
-        }
-        self._reverse: dict[str, str] = {}
-        self._counters: dict[str, int] = {category: 0 for category in _NAME_LABELS}
         self._lock = threading.RLock()
         for name in known_names:
             self.add_known(name)
@@ -270,16 +438,13 @@ class Pseudonymizer:
                 self._known.add(name)
 
     def _allocate(self, category: str, original: str) -> str:
-        with self._lock:
-            mapping = self._forward[category]
-            placeholder = mapping.get(original)
-            if placeholder is not None:
-                return placeholder
-            self._counters[category] += 1
-            placeholder = f"[{_NAME_LABELS[category]}_{self._counters[category]}]"
-            mapping[original] = placeholder
-            self._reverse[placeholder] = original
-            return placeholder
+        message = category.encode("utf-8") + b"\x00" + norm(category, original).encode(
+            "utf-8"
+        )
+        digest = hmac.new(self._key, message, hashlib.sha256).hexdigest()[:8]
+        placeholder = f"[{_NAME_LABELS[category]}_{digest}]"
+        self._store.allocate(category, original, placeholder)
+        return placeholder
 
     def _seed_name(self, value: str) -> None:
         value = value.strip()
@@ -384,11 +549,17 @@ class Pseudonymizer:
             return text
 
         sentinels: dict[str, str] = {}
+        protected: dict[str, str] = {}
+
+        def protect(match: re.Match[str]) -> str:
+            sentinel = f"\x00P{len(protected)}\x00"
+            protected[sentinel] = match.group(0)
+            return sentinel
 
         def replace(original: str, category: str) -> str:
             return self._replace(sentinels, category, original)
 
-        result = text
+        result = PLACEHOLDER_RE.sub(protect, text)
         for name in sorted(self._known, key=len, reverse=True):
             result = _known_pattern(name).sub(
                 lambda match: replace(match.group(0), "name"), result
@@ -417,16 +588,20 @@ class Pseudonymizer:
         )
         for sentinel, placeholder in sentinels.items():
             result = result.replace(sentinel, placeholder)
+        for sentinel, placeholder in protected.items():
+            result = result.replace(sentinel, placeholder)
         return result
 
     def restore(self, text: str) -> str:
         if not text:
             return text
-        with self._lock:
-            items = list(self._reverse.items())
-        for placeholder, original in items:
-            text = text.replace(placeholder, original)
-        return text
+
+        def replace(match: re.Match[str]) -> str:
+            placeholder = match.group(0)
+            original = self._store.lookup(placeholder)
+            return original if original is not None else placeholder
+
+        return PLACEHOLDER_RE.sub(replace, text)
 
     def restore_value(self, value: object) -> object:
         if isinstance(value, str):
@@ -439,3 +614,39 @@ class Pseudonymizer:
                 for key, item in value.items()
             }
         return value
+
+    def unresolved(self, value: object) -> set[str]:
+        found: set[str] = set()
+
+        def walk(item: object) -> None:
+            if isinstance(item, str):
+                stripped = item.strip()
+                if stripped.startswith(("{", "[")):
+                    try:
+                        decoded = json.loads(stripped)
+                    except (ValueError, TypeError):
+                        decoded = None
+                    if isinstance(decoded, (dict, list)):
+                        walk(decoded)
+                        return
+                for match in LOOKALIKE_RE.finditer(item):
+                    placeholder = match.group(0)
+                    resolvable = (
+                        PLACEHOLDER_RE.fullmatch(placeholder) is not None
+                        and self._store.lookup(placeholder) is not None
+                    )
+                    if not resolvable:
+                        found.add(placeholder)
+                return
+            if isinstance(item, dict):
+                for key, nested in item.items():
+                    if isinstance(key, str):
+                        walk(key)
+                    walk(nested)
+                return
+            if isinstance(item, (list, tuple)):
+                for nested in item:
+                    walk(nested)
+
+        walk(value)
+        return found
