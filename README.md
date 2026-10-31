@@ -46,21 +46,31 @@ Token values are never logged or included in error messages. See `.env.example`;
 | `create_page(course_id, section, name, content_html, video_url=None, ...)` **WRITE, preview** | `local_grokbot_create_module` (page) |
 | `create_resource(course_id, section, name, filename, file_url \| file_base64, ...)` **WRITE, preview** | `core_files_upload` to the bot's draft area, then `local_grokbot_create_module` (resource) |
 | `update_activity(cmid, name, intro, visible, settings)` **WRITE, preview** | `local_grokbot_update_module` |
-| `set_activity_visibility(cmid, visible)` **WRITE, preview** | `core_course_edit_module` (show/hide) |
+| `set_activity_visibility(cmid, visible)` **WRITE, preview** | `core_course_edit_module` (show/hide); returns `{ok, cmid, visible}` |
 | `set_completion(cmid, mode, posts, pass_grade)` **WRITE, preview** | `local_grokbot_update_module` |
 | `set_access_restriction(target_type, course_id, target, required_cmids, open_from)` **WRITE, preview** | `local_grokbot_update_module` / `local_grokbot_set_section_availability` |
 | `add_quiz_questions(quiz_id, questions)` **WRITE, preview** | `local_grokbot_add_quiz_questions` |
 | `add_sections(course_id, names, summaries)` **WRITE, preview** | `local_grokbot_add_sections` |
 | `update_section(course_id, section, name, summary)` **WRITE, preview** | `local_grokbot_update_section` |
 | `post_forum_discussion(forum_id, subject, message)` **WRITE, preview** | `mod_forum_add_discussion` |
+| `create_workshop(course_id, section, name, strategy, grade, gradinggrade, ...)` **WRITE, preview** | `local_grokbot_create_module` (workshop) |
+| `create_wiki(course_id, section, name, mode, first_page_title, group_mode, ...)` **WRITE, preview** | `local_grokbot_create_module` (wiki) |
+| `create_glossary(course_id, section, name, display_format, default_approval, ...)` **WRITE, preview** | `local_grokbot_create_module` (glossary) |
+| `create_feedback(course_id, section, name, anonymous, ...)` **WRITE, preview** | `local_grokbot_create_module` (feedback) |
+| `create_h5pactivity(course_id, section, name, filename, file_url \| file_base64, ...)` **WRITE, preview** | `core_files_upload`, then `local_grokbot_create_module` (h5pactivity, `packagefile`) |
+| `create_openmaic(course_id, section, name, prompt, lecture_id, completion_min_progress, ...)` **WRITE, preview** | `local_grokbot_create_module` (openmaic) |
+| `set_rubric(cmid, name, criteria, description, area)` **WRITE, preview** | `local_grokbot_set_rubric` |
+| `set_grade_categories(course_id, categories, aggregation)` **WRITE, preview** | `local_grokbot_set_grade_categories` |
+| `create_badge(course_id, name, description, activity_cmids, min_course_grade, enable)` **WRITE, preview** | `local_grokbot_create_badge` |
 
 Every tool returns a JSON object. Moodle responses are returned unchanged when they are objects. Lists and nulls are wrapped (for example `{"courses": [...]}`, `{"users": [...]}`, `{"result": null}`), and the write tools add `"ok": true`.
 Moodle errors come back as `{"error": "<wsfunction>: [errorcode] message"}`.
 WRITE tools are described as "only call after the teacher confirmed".
 Tools marked *preview* take `confirm` (default `false`): without it they return `{"preview": true, ...}`
 describing the change and make no Moodle call; with `confirm=true` they apply it.
-`local_grokbot_*` functions come from the `local_grokbot` Moodle plugin (version 0.2.0 or later).
-`create_resource` downloads `file_url` (http/https, max 200 MB) into memory on the MCP server and sends the
+`local_grokbot_*` functions come from the `local_grokbot` Moodle plugin (version 0.3.0 or later).
+The new `create_*` tools accept `settings`: extra module fields passed through as is.
+`create_resource` / `create_h5pactivity` download `file_url` (http/https, max 200 MB) into memory on the MCP server and sends the
 file base64-encoded, so Moodle's `post_max_size` must allow roughly 1.4x the file size.
 
 Your Moodle web service must include all of these functions, and the token's user needs the matching capabilities.

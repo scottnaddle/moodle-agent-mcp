@@ -29,6 +29,10 @@ MAX_UPLOAD_BYTES = 200 * 1024 * 1024
 SUBMISSION_TYPES = {"onlinetext", "file"}
 FORUM_TYPES = {"general", "qanda", "single", "eachuser", "blog"}
 COMPLETION_MODES = {"none", "manual", "view", "submit", "pass", "grade", "posts"}
+WORKSHOP_STRATEGIES = {"accumulative", "comments", "numerrors", "rubric"}
+WORKSHOP_SUBMISSION_TYPES = {"text", "file"}
+WIKI_MODES = {"collaborative", "individual"}
+SETTINGS_NOTE = "settings: extra module fields passed to Moodle as is (advanced; override the other arguments)."
 YOUTUBE_RE = re.compile(
     r"(?:youtube(?:-nocookie)?\.com/(?:watch\?(?:.*&)?v=|embed/|shorts/|live/)|youtu\.be/)([\w-]{6,})"
 )
@@ -63,6 +67,31 @@ class QuizQuestion(BaseModel):
     graderinfo: str | None = Field(default=None, description="essay: information for graders")
     responseformat: Literal["editor", "editorfilepicker", "plain", "monospaced", "noinline"] | None = None
     responsefieldlines: int | None = None
+
+
+class RubricLevel(BaseModel):
+    definition: str = Field(description="What this level looks like")
+    score: float = Field(description="Points for this level (>= 0, distinct within the criterion)")
+
+
+class RubricCriterion(BaseModel):
+    description: str = Field(description="Criterion, e.g. 'Learning-goal alignment'")
+    levels: list[RubricLevel] = Field(description="At least 2 levels")
+
+
+class GradeItemRef(BaseModel):
+    cmid: int
+    itemnumber: int = Field(description="Grade item number; workshop: 0 = submission, 1 = assessment")
+
+
+class GradeCategory(BaseModel):
+    name: str = Field(description="Category name (an existing category with this name is reused)")
+    weight: float | None = Field(
+        default=None, description="weighted_mean: weight; natural: percent; ignored for mean"
+    )
+    cmids: list[int | GradeItemRef] = Field(
+        default=[], description="Activities to move in: a cmid moves all its grade items, {cmid, itemnumber} one"
+    )
 
 
 def _video_embed(url: str) -> str:
@@ -109,6 +138,23 @@ async def _download(url: str, limit: int = MAX_UPLOAD_BYTES) -> bytes:
                     raise ValueError(f"file is larger than {limit} bytes")
                 chunks.append(chunk)
     return b"".join(chunks)
+
+
+def _check_file(filename: str, file_url: str | None, file_base64: str | None) -> tuple[bytes | None, str | None]:
+    """Validate an upload request; returns (decoded base64 data or None, error or None)."""
+    if (file_url is None) == (file_base64 is None):
+        return None, "give exactly one of file_url or file_base64"
+    if not filename.strip() or "/" in filename or "\\" in filename:
+        return None, "filename must be a plain file name"
+    if file_base64 is None:
+        return None, None
+    try:
+        data = base64.b64decode(file_base64, validate=True)
+    except (binascii.Error, ValueError):
+        return None, "file_base64 is not valid base64"
+    if len(data) > MAX_UPLOAD_BYTES:
+        return None, f"file is larger than {MAX_UPLOAD_BYTES} bytes"
+    return data, None
 
 
 def _wrap(result: Any, key: str = "result") -> dict[str, Any]:
@@ -439,21 +485,22 @@ def create_mcp(client: MoodleClient) -> FastMCP:
         visible: int = 1,
         confirm: bool = False,
     ) -> dict[str, Any]:
-        if (file_url is None) == (file_base64 is None):
-            return {"error": "give exactly one of file_url or file_base64"}
-        if not filename.strip() or "/" in filename or "\\" in filename:
-            return {"error": "filename must be a plain file name"}
-        data: bytes | None = None
-        if file_base64 is not None:
-            try:
-                data = base64.b64decode(file_base64, validate=True)
-            except (binascii.Error, ValueError):
-                return {"error": "file_base64 is not valid base64"}
-            if len(data) > MAX_UPLOAD_BYTES:
-                return {"error": f"file is larger than {MAX_UPLOAD_BYTES} bytes"}
         settings: dict[str, Any] = {"completion": 2, "completionview": 1} if completion_view else {}
+        return await create_with_file(
+            course_id, section, "resource", name, intro, visible, settings, "files", filename, file_url, file_base64,
+            confirm,
+        )  # fmt: skip
+
+    async def create_with_file(
+        course_id: int, section: int, modname: str, name: str, intro: str, visible: int, settings: dict[str, Any],
+        file_setting: str, filename: str, file_url: str | None, file_base64: str | None, confirm: bool,
+    ) -> dict[str, Any]:  # fmt: skip
+        """Preview, or upload the file to the user's draft area and create the module with settings[file_setting]."""
+        data, error = _check_file(filename, file_url, file_base64)
+        if error:
+            return {"error": error}
         if not confirm:
-            module = {"course_id": course_id, "section": section, "modname": "resource", "name": name,
+            module = {"course_id": course_id, "section": section, "modname": modname, "name": name,
                       "intro": intro, "visible": visible, "settings": settings}  # fmt: skip
             file = {"filename": filename, "source": file_url or "base64"}
             if data is not None:
@@ -474,9 +521,282 @@ def create_mcp(client: MoodleClient) -> FastMCP:
         )  # fmt: skip
         if "error" in upload:
             return upload
-        settings["files"] = upload["itemid"]
-        out = await create_module(course_id, section, "resource", name, intro, visible, settings, True)
+        settings = {**settings, file_setting: upload["itemid"]}
+        out = await create_module(course_id, section, modname, name, intro, visible, settings, True)
         return out if "error" in out else {**out, "size_bytes": len(data)}
+
+    @mcp.tool(
+        description=f"{WRITE_NOTE} Create a workshop (peer assessment) in a course section. {CONFIRM_NOTE} "
+        "strategy: accumulative|comments|numerrors|rubric (define a rubric afterwards with set_rubric). "
+        "grade = submission max, gradinggrade = assessment max. submission_types: text and/or file. "
+        "Dates are unix timestamps. The workshop starts in the setup phase. " + SETTINGS_NOTE
+    )
+    async def create_workshop(
+        course_id: int,
+        section: int,
+        name: str,
+        intro: str = "",
+        strategy: str = "rubric",
+        grade: float = 80,
+        gradinggrade: float = 20,
+        instructions_submission: str = "",
+        instructions_assessment: str = "",
+        submission_types: list[str] = ["text", "file"],  # noqa: B006 - never mutated
+        submission_start: int | None = None,
+        submission_end: int | None = None,
+        assessment_start: int | None = None,
+        assessment_end: int | None = None,
+        self_assessment: bool = False,
+        visible: int = 1,
+        settings: dict[str, Any] = {},  # noqa: B006 - never mutated
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        if strategy not in WORKSHOP_STRATEGIES:
+            return {"error": f"strategy must be one of {sorted(WORKSHOP_STRATEGIES)}"}
+        if not submission_types or set(submission_types) - WORKSHOP_SUBMISSION_TYPES:
+            return {"error": "submission_types must be a non-empty subset of ['file', 'text']"}
+        module: dict[str, Any] = {
+            "strategy": strategy,
+            "grade": grade,
+            "gradinggrade": gradinggrade,
+            "submissiontypetext": int("text" in submission_types),
+            "submissiontypefile": int("file" in submission_types),
+            "useselfassessment": int(self_assessment),
+        }
+        if instructions_submission:
+            module["instructauthors"] = instructions_submission
+        if instructions_assessment:
+            module["instructreviewers"] = instructions_assessment
+        dates = {"submissionstart": submission_start, "submissionend": submission_end,
+                 "assessmentstart": assessment_start, "assessmentend": assessment_end}  # fmt: skip
+        module.update({k: v for k, v in dates.items() if v is not None})
+        settings = {**module, **settings}
+        return await create_module(course_id, section, "workshop", name, intro, visible, settings, confirm)
+
+    @mcp.tool(
+        description=f"{WRITE_NOTE} Create a wiki in a course section. {CONFIRM_NOTE} mode: collaborative|individual. "
+        "group_mode: 0 none, 1 separate groups, 2 visible groups. " + SETTINGS_NOTE
+    )
+    async def create_wiki(
+        course_id: int,
+        section: int,
+        name: str,
+        intro: str = "",
+        mode: str = "collaborative",
+        first_page_title: str = "",
+        group_mode: int = 0,
+        visible: int = 1,
+        settings: dict[str, Any] = {},  # noqa: B006 - never mutated
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        if mode not in WIKI_MODES:
+            return {"error": f"mode must be one of {sorted(WIKI_MODES)}"}
+        if group_mode not in (0, 1, 2):
+            return {"error": "group_mode must be 0, 1 or 2"}
+        module: dict[str, Any] = {"wikimode": mode, "groupmode": group_mode}
+        if first_page_title:
+            module["firstpagetitle"] = first_page_title
+        settings = {**module, **settings}
+        return await create_module(course_id, section, "wiki", name, intro, visible, settings, confirm)
+
+    @mcp.tool(
+        description=f"{WRITE_NOTE} Create a glossary in a course section. {CONFIRM_NOTE} "
+        "default_approval=false makes student entries wait for teacher approval. completion_entries > 0 completes "
+        "the glossary after that many entries. " + SETTINGS_NOTE
+    )
+    async def create_glossary(
+        course_id: int,
+        section: int,
+        name: str,
+        intro: str = "",
+        display_format: str = "dictionary",
+        default_approval: bool = True,
+        allow_comments: bool = False,
+        completion_entries: int = 0,
+        visible: int = 1,
+        settings: dict[str, Any] = {},  # noqa: B006 - never mutated
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        module: dict[str, Any] = {
+            "displayformat": display_format,
+            "defaultapproval": int(default_approval),
+            "allowcomments": int(allow_comments),
+        }
+        if completion_entries > 0:
+            module.update(completion=2, completionentries=completion_entries)
+        settings = {**module, **settings}
+        return await create_module(course_id, section, "glossary", name, intro, visible, settings, confirm)
+
+    @mcp.tool(
+        description=f"{WRITE_NOTE} Create a feedback (survey) activity in a course section. {CONFIRM_NOTE} "
+        "Questions are added in Moodle afterwards. timeopen/timeclose: unix timestamps. completion_submit "
+        "completes it on submission. " + SETTINGS_NOTE
+    )
+    async def create_feedback(
+        course_id: int,
+        section: int,
+        name: str,
+        intro: str = "",
+        anonymous: bool = True,
+        multiple_submit: bool = False,
+        timeopen: int | None = None,
+        timeclose: int | None = None,
+        page_after_submit: str = "",
+        completion_submit: bool = False,
+        visible: int = 1,
+        settings: dict[str, Any] = {},  # noqa: B006 - never mutated
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        module: dict[str, Any] = {"anonymous": 1 if anonymous else 2, "multiple_submit": int(multiple_submit)}
+        times = {"timeopen": timeopen, "timeclose": timeclose}
+        module.update({k: v for k, v in times.items() if v is not None})
+        if page_after_submit:
+            module["page_after_submit"] = page_after_submit
+        if completion_submit:
+            module.update(completion=2, completionsubmit=1)
+        settings = {**module, **settings}
+        return await create_module(course_id, section, "feedback", name, intro, visible, settings, confirm)
+
+    @mcp.tool(
+        description=f"{WRITE_NOTE} Upload a .h5p package and create an H5P activity in a course section. "
+        f"{CONFIRM_NOTE} Give exactly one of file_url (downloaded by the server, max 200 MB) or file_base64. "
+        "completion_pass_grade: passing grade (out of grade) that completes the activity. " + SETTINGS_NOTE
+    )
+    async def create_h5pactivity(
+        course_id: int,
+        section: int,
+        name: str,
+        filename: str,
+        file_url: str | None = None,
+        file_base64: str | None = None,
+        intro: str = "",
+        grade: float = 100,
+        completion_pass_grade: float | None = None,
+        completion_view: bool = False,
+        visible: int = 1,
+        settings: dict[str, Any] = {},  # noqa: B006 - never mutated
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        if not filename.lower().endswith(".h5p"):
+            return {"error": "filename must end with .h5p"}
+        module: dict[str, Any] = {"grade": grade}
+        if completion_pass_grade is not None:
+            module.update(completion=2, completionusegrade=1, completionpassgrade=1, gradepass=completion_pass_grade)
+        if completion_view:
+            module.update(completion=2, completionview=1)
+        return await create_with_file(
+            course_id, section, "h5pactivity", name, intro, visible, {**module, **settings}, "packagefile", filename,
+            file_url, file_base64, confirm,
+        )  # fmt: skip
+
+    @mcp.tool(
+        description=f"{WRITE_NOTE} Create an OpenMAIC multi-agent lecture activity in a course section. "
+        f"{CONFIRM_NOTE} prompt: lecture manuscript / generation prompt (generation is started on the activity "
+        "page); lecture_id links an existing OpenMAIC lecture instead. completion_min_progress: percent watched "
+        "that completes the activity (0 = no completion rule). " + SETTINGS_NOTE
+    )
+    async def create_openmaic(
+        course_id: int,
+        section: int,
+        name: str,
+        intro: str = "",
+        prompt: str = "",
+        lecture_id: str | None = None,
+        completion_min_progress: int = 80,
+        grade: int = 100,
+        visible: int = 1,
+        settings: dict[str, Any] = {},  # noqa: B006 - never mutated
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        if not 0 <= completion_min_progress <= 100:
+            return {"error": "completion_min_progress must be between 0 and 100"}
+        module: dict[str, Any] = {"grade": grade}
+        if prompt:
+            module["manuscript"] = prompt
+        if lecture_id:
+            module["lectureid"] = lecture_id
+        if completion_min_progress > 0:
+            module.update(completion=2, completionminprogress=completion_min_progress)
+        settings = {**module, **settings}
+        return await create_module(course_id, section, "openmaic", name, intro, visible, settings, confirm)
+
+    @mcp.tool(
+        description=f"{WRITE_NOTE} Define (or replace) the rubric of an activity. {CONFIRM_NOTE} "
+        "Assignments (area 'submissions') and other advanced-grading areas get a ready rubric shown to students; "
+        "a workshop with strategy 'rubric' gets its assessment form replaced (whole-number scores 0-100; area "
+        "ignored). Each criterion needs >= 2 levels with distinct scores. Fails once the rubric was used."
+    )
+    async def set_rubric(
+        cmid: int,
+        name: str,
+        criteria: list[RubricCriterion],
+        description: str = "",
+        area: str = "submissions",
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        if not criteria:
+            return {"error": "criteria must not be empty"}
+        if any(len(c.levels) < 2 for c in criteria):
+            return {"error": "every criterion needs at least 2 levels"}
+        payload = [c.model_dump() for c in criteria]
+        preview = {"cmid": cmid, "name": name, "area": area, "criteria": payload,
+                   "max_score": sum(max(lv.score for lv in c.levels) for c in criteria)}  # fmt: skip
+        return await write(
+            "local_grokbot_set_rubric", preview, confirm,
+            cmid=cmid, name=name, criteria=json.dumps(payload), description=description, areaname=area,
+        )  # fmt: skip
+
+    @mcp.tool(
+        description=f"{WRITE_NOTE} Organise the gradebook into weighted categories under the course total and move "
+        f"activities' grade items into them. {CONFIRM_NOTE} aggregation (course total and new categories): "
+        "weighted_mean (weight = coefficient, e.g. percent) | natural (weight = percent) | mean (weights ignored). "
+        "Categories are reused by name."
+    )
+    async def set_grade_categories(
+        course_id: int,
+        categories: list[GradeCategory],
+        aggregation: Literal["weighted_mean", "natural", "mean"] = "weighted_mean",
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        if not categories:
+            return {"error": "categories must not be empty"}
+        if aggregation != "mean" and any(c.weight is None for c in categories):
+            return {"error": f"every category needs a weight for {aggregation}"}
+        payload = [c.model_dump(exclude_none=True) for c in categories]
+        preview = {"course_id": course_id, "aggregation": aggregation, "categories": payload}
+        if aggregation != "mean":
+            preview["total_weight"] = sum(c.weight or 0 for c in categories)
+        return await write(
+            "local_grokbot_set_grade_categories", preview, confirm,
+            courseid=course_id, categories=json.dumps(payload), aggregation=aggregation,
+        )  # fmt: skip
+
+    @mcp.tool(
+        description=f"{WRITE_NOTE} Create a course badge awarded when all activity_cmids are completed and/or the "
+        f"course is completed with at least min_course_grade. {CONFIRM_NOTE} The activities need completion "
+        "tracking; the course-grade criterion needs course completion configured. enable=true activates it "
+        "(it can no longer be edited freely once awarded)."
+    )
+    async def create_badge(
+        course_id: int,
+        name: str,
+        description: str,
+        activity_cmids: list[int] = [],  # noqa: B006 - never mutated
+        min_course_grade: float | None = None,
+        enable: bool = False,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        if not activity_cmids and min_course_grade is None:
+            return {"error": "give activity_cmids and/or min_course_grade"}
+        if not description.strip():
+            return {"error": "description must not be empty"}
+        criteria = {"activities": activity_cmids, "min_course_grade": min_course_grade}
+        preview = {"course_id": course_id, "name": name, "description": description, "criteria": criteria,
+                   "enable": enable}  # fmt: skip
+        return await write(
+            "local_grokbot_create_badge", preview, confirm,
+            courseid=course_id, name=name, description=description, criteria=json.dumps(criteria), enable=enable,
+        )  # fmt: skip
 
     @mcp.tool(
         description=f"{WRITE_NOTE} Update an activity (local_grokbot_update_module). {CONFIRM_NOTE} "
@@ -500,7 +820,10 @@ def create_mcp(client: MoodleClient) -> FastMCP:
     @mcp.tool(description=f"{WRITE_NOTE} Show or hide an activity on the course page. {CONFIRM_NOTE}")
     async def set_activity_visibility(cmid: int, visible: bool, confirm: bool = False) -> dict[str, Any]:
         action = "show" if visible else "hide"
-        return await write("core_course_edit_module", {"cmid": cmid, "action": action}, confirm, action=action, id=cmid)
+        preview = {"cmid": cmid, "action": action}
+        result = await write("core_course_edit_module", preview, confirm, action=action, id=cmid)
+        # Moodle answers with the re-rendered activity HTML; report just the outcome.
+        return {"ok": True, "cmid": cmid, "visible": visible} if result.get("ok") else result
 
     @mcp.tool(
         description=f"{WRITE_NOTE} Set the completion rule of an activity. {CONFIRM_NOTE} "

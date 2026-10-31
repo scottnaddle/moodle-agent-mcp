@@ -14,6 +14,8 @@ WRITE_TOOLS = {
     "create_course", "create_assignment", "create_quiz", "create_forum", "create_page", "create_resource",
     "update_activity", "set_activity_visibility", "set_completion", "set_access_restriction",
     "add_quiz_questions", "add_sections", "update_section", "post_forum_discussion",
+    "create_workshop", "create_wiki", "create_glossary", "create_feedback", "create_h5pactivity", "create_openmaic",
+    "set_rubric", "set_grade_categories", "create_badge",
 }  # fmt: skip
 
 

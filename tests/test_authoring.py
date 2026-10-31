@@ -34,6 +34,10 @@ def without_auth(sent):
 
 
 MODULE = {"course_id": 5, "section": 2, "name": "N"}
+RUBRIC = [
+    {"description": "Alignment", "levels": [{"definition": "weak", "score": 5.0}, {"definition": "strong", "score": 25.0}]},
+    {"description": "Ethics", "levels": [{"definition": "none", "score": 0.0}, {"definition": "clear", "score": 25.0}]},
+]
 YT = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 
 # (tool, args, wsfunction, expected params; "settings" / "questions" are compared as decoded JSON)
@@ -107,8 +111,6 @@ WRITES = [
         "local_grokbot_update_module",
         {"cmid": "12", "name": "New", "intro": "", "visible": "-1", "settings": {"duedate": 5}},
     ),
-    ("set_activity_visibility", {"cmid": 12, "visible": False}, "core_course_edit_module", {"action": "hide", "id": "12"}),
-    ("set_activity_visibility", {"cmid": 12, "visible": True}, "core_course_edit_module", {"action": "show", "id": "12"}),
     ("set_completion", {"cmid": 12, "mode": "none"}, "local_grokbot_update_module", {"cmid": "12", "settings": {"completion": 0}}),
     ("set_completion", {"cmid": 12, "mode": "manual"}, "local_grokbot_update_module", {"cmid": "12", "settings": {"completion": 1}}),
     (
@@ -222,6 +224,127 @@ WRITES = [
         {"courseid": "5", "section": "1", "summary": "<p>s</p>"},
     ),
     (
+        "create_workshop",
+        {**MODULE, "instructions_submission": "<p>s</p>", "submission_end": 50, "settings": {"nattachments": 3}},
+        "local_grokbot_create_module",
+        {
+            "courseid": "5", "section": "2", "modname": "workshop", "name": "N", "intro": "", "visible": "1",
+            "settings": {
+                "strategy": "rubric", "grade": 80, "gradinggrade": 20, "submissiontypetext": 1, "submissiontypefile": 1,
+                "useselfassessment": 0, "instructauthors": "<p>s</p>", "submissionend": 50, "nattachments": 3,
+            },
+        },
+    ),
+    (
+        "create_workshop",
+        {**MODULE, "strategy": "accumulative", "grade": 25, "gradinggrade": 10, "submission_types": ["file"],
+         "self_assessment": True, "instructions_assessment": "<p>a</p>", "assessment_start": 7},
+        "local_grokbot_create_module",
+        {
+            "courseid": "5", "section": "2", "modname": "workshop", "name": "N", "intro": "", "visible": "1",
+            "settings": {
+                "strategy": "accumulative", "grade": 25, "gradinggrade": 10, "submissiontypetext": 0,
+                "submissiontypefile": 1, "useselfassessment": 1, "instructreviewers": "<p>a</p>", "assessmentstart": 7,
+            },
+        },
+    ),
+    (
+        "create_wiki",
+        {**MODULE, "mode": "individual", "first_page_title": "Start", "group_mode": 1},
+        "local_grokbot_create_module",
+        {
+            "courseid": "5", "section": "2", "modname": "wiki", "name": "N", "intro": "", "visible": "1",
+            "settings": {"wikimode": "individual", "groupmode": 1, "firstpagetitle": "Start"},
+        },
+    ),
+    (
+        "create_glossary",
+        {**MODULE, "default_approval": False, "completion_entries": 2},
+        "local_grokbot_create_module",
+        {
+            "courseid": "5", "section": "2", "modname": "glossary", "name": "N", "intro": "", "visible": "1",
+            "settings": {
+                "displayformat": "dictionary", "defaultapproval": 0, "allowcomments": 0, "completion": 2,
+                "completionentries": 2,
+            },
+        },
+    ),
+    (
+        "create_feedback",
+        {**MODULE, "anonymous": False, "timeclose": 99, "page_after_submit": "<p>Thanks</p>", "completion_submit": True},
+        "local_grokbot_create_module",
+        {
+            "courseid": "5", "section": "2", "modname": "feedback", "name": "N", "intro": "", "visible": "1",
+            "settings": {
+                "anonymous": 2, "multiple_submit": 0, "timeclose": 99, "page_after_submit": "<p>Thanks</p>",
+                "completion": 2, "completionsubmit": 1,
+            },
+        },
+    ),
+    (
+        "create_openmaic",
+        {**MODULE, "prompt": "Teach agents", "settings": {"grade": 0}},
+        "local_grokbot_create_module",
+        {
+            "courseid": "5", "section": "2", "modname": "openmaic", "name": "N", "intro": "", "visible": "1",
+            "settings": {"grade": 0, "manuscript": "Teach agents", "completion": 2, "completionminprogress": 80},
+        },
+    ),
+    (
+        "create_openmaic",
+        {**MODULE, "lecture_id": "abc-1", "completion_min_progress": 0},
+        "local_grokbot_create_module",
+        {
+            "courseid": "5", "section": "2", "modname": "openmaic", "name": "N", "intro": "", "visible": "1",
+            "settings": {"grade": 100, "lectureid": "abc-1"},
+        },
+    ),
+    (
+        "set_rubric",
+        {"cmid": 12, "name": "R", "criteria": RUBRIC},
+        "local_grokbot_set_rubric",
+        {"cmid": "12", "name": "R", "criteria": RUBRIC, "description": "", "areaname": "submissions"},
+    ),
+    (
+        "set_grade_categories",
+        {"course_id": 5, "categories": [
+            {"name": "Quizzes", "weight": 15, "cmids": [3, 4]},
+            {"name": "Peer review", "weight": 10, "cmids": [{"cmid": 9, "itemnumber": 1}]},
+        ]},
+        "local_grokbot_set_grade_categories",
+        {
+            "courseid": "5", "aggregation": "weighted_mean",
+            "categories": [
+                {"name": "Quizzes", "weight": 15.0, "cmids": [3, 4]},
+                {"name": "Peer review", "weight": 10.0, "cmids": [{"cmid": 9, "itemnumber": 1}]},
+            ],
+        },
+    ),
+    (
+        "set_grade_categories",
+        {"course_id": 5, "aggregation": "mean", "categories": [{"name": "All"}]},
+        "local_grokbot_set_grade_categories",
+        {"courseid": "5", "aggregation": "mean", "categories": [{"name": "All", "cmids": []}]},
+    ),
+    (
+        "create_badge",
+        {"course_id": 5, "name": "B", "description": "D", "activity_cmids": [3, 4], "min_course_grade": 70, "enable": True},
+        "local_grokbot_create_badge",
+        {
+            "courseid": "5", "name": "B", "description": "D", "enable": "1",
+            "criteria": {"activities": [3, 4], "min_course_grade": 70.0},
+        },
+    ),
+    (
+        "create_badge",
+        {"course_id": 5, "name": "B", "description": "D", "activity_cmids": [3]},
+        "local_grokbot_create_badge",
+        {
+            "courseid": "5", "name": "B", "description": "D", "enable": "0",
+            "criteria": {"activities": [3], "min_course_grade": None},
+        },
+    ),
+    (
         "post_forum_discussion",
         {"forum_id": 7, "subject": "Hello", "message": "<p>Welcome</p>"},
         "mod_forum_add_discussion",
@@ -246,7 +369,7 @@ async def test_write_confirm_calls_right_wsfunction(mcp, tool, args, wsfunction,
     assert out == {"ok": True, "cmid": 99}
     assert len(calls) == 1
     sent = without_auth(calls[0])
-    for key in ("settings", "questions"):
+    for key in ("settings", "questions", "criteria", "categories"):
         if key in sent:
             sent[key] = json.loads(sent[key])
     assert sent == {"wsfunction": wsfunction, **params}
@@ -266,6 +389,21 @@ async def test_write_confirm_calls_right_wsfunction(mcp, tool, args, wsfunction,
         ("create_resource", {**MODULE, "filename": "a.pdf", "file_url": "https://x/a", "file_base64": "QQ=="}, "exactly one"),
         ("create_resource", {**MODULE, "filename": "a.pdf", "file_base64": "not base64!"}, "base64"),
         ("create_resource", {**MODULE, "filename": "../a.pdf", "file_base64": "QQ=="}, "plain file name"),
+        ("create_workshop", {**MODULE, "strategy": "magic"}, "strategy must be"),
+        ("create_workshop", {**MODULE, "submission_types": []}, "submission_types"),
+        ("create_workshop", {**MODULE, "submission_types": ["paper"]}, "submission_types"),
+        ("create_wiki", {**MODULE, "mode": "shared"}, "mode must be"),
+        ("create_wiki", {**MODULE, "group_mode": 5}, "group_mode"),
+        ("create_h5pactivity", {**MODULE, "filename": "a.zip", "file_base64": "QQ=="}, ".h5p"),
+        ("create_h5pactivity", {**MODULE, "filename": "a.h5p"}, "exactly one"),
+        ("create_openmaic", {**MODULE, "completion_min_progress": 101}, "between 0 and 100"),
+        ("set_rubric", {"cmid": 1, "name": "R", "criteria": []}, "must not be empty"),
+        ("set_rubric", {"cmid": 1, "name": "R", "criteria": [{"description": "x", "levels": [{"definition": "a", "score": 1}]}]},
+         "at least 2 levels"),
+        ("set_grade_categories", {"course_id": 5, "categories": []}, "must not be empty"),
+        ("set_grade_categories", {"course_id": 5, "categories": [{"name": "Q", "cmids": [1]}]}, "needs a weight"),
+        ("create_badge", {"course_id": 5, "name": "B", "description": "D"}, "activity_cmids and/or"),
+        ("create_badge", {"course_id": 5, "name": "B", "description": " ", "activity_cmids": [1]}, "description"),
     ],
 )  # fmt: skip
 async def test_invalid_input_is_rejected_without_calls(mcp, tool, args, message):
@@ -279,6 +417,33 @@ async def test_moodle_error_is_returned(mcp):
     err = {"exception": "invalid_parameter_exception", "errorcode": "invalidparameter", "message": "bad"}
     out, _ = await confirmed(mcp, "set_completion", {"cmid": 1, "mode": "view"}, err)
     assert set(out) == {"error"} and "invalidparameter" in out["error"]
+
+
+@pytest.mark.parametrize("visible", [True, False])
+async def test_set_activity_visibility_returns_plain_result(mcp, visible):
+    _c, preview = await mcp.call_tool("set_activity_visibility", {"cmid": 12, "visible": visible})
+    action = "show" if visible else "hide"
+    assert preview["preview"] is True and preview["action"] == action
+    out, calls = await confirmed(mcp, "set_activity_visibility", {"cmid": 12, "visible": visible}, "<li>html</li>")
+    assert out == {"ok": True, "cmid": 12, "visible": visible}
+    assert [without_auth(c) for c in calls] == [{"wsfunction": "core_course_edit_module", "action": action, "id": "12"}]
+
+
+async def test_set_activity_visibility_error(mcp):
+    err = {"exception": "x", "errorcode": "nopermissions", "message": "m"}
+    out, _ = await confirmed(mcp, "set_activity_visibility", {"cmid": 12, "visible": True}, err)
+    assert set(out) == {"error"}
+
+
+async def test_set_rubric_preview_shows_max_score(mcp):
+    _c, out = await mcp.call_tool("set_rubric", {"cmid": 12, "name": "R", "criteria": RUBRIC})
+    assert out["preview"] is True and out["max_score"] == 50
+
+
+async def test_set_grade_categories_preview_shows_total_weight(mcp):
+    cats = [{"name": "A", "weight": 60, "cmids": [1]}, {"name": "B", "weight": 40}]
+    _c, out = await mcp.call_tool("set_grade_categories", {"course_id": 5, "categories": cats})
+    assert out["preview"] is True and out["total_weight"] == 100
 
 
 PDF = b"%PDF-1.4 fake"
@@ -442,3 +607,31 @@ async def test_list_forum_discussions_error(mcp):
         respx.post(ENDPOINT).respond(text=json.dumps(err))
         _c, out = await mcp.call_tool("list_forum_discussions", {"forum_id": 7})
     assert set(out) == {"error"}
+
+
+H5P = b"PK\x03\x04 fake h5p"
+
+
+async def test_create_h5pactivity_uploads_package(mcp):
+    replies = {**RESOURCE_REPLIES, "local_grokbot_create_module": {"cmid": 78, "instance": 9, "modname": "h5pactivity"}}
+    args = {**MODULE, "filename": "tutor.h5p", "file_base64": base64.b64encode(H5P).decode(), "completion_pass_grade": 60}
+    with respx.mock:
+        route = respx.post(ENDPOINT).mock(side_effect=routed(replies))
+        _c, preview = await mcp.call_tool("create_h5pactivity", args)
+        assert route.call_count == 0
+        _c, out = await mcp.call_tool("create_h5pactivity", {**args, "confirm": True})
+        calls = [form(c.request) for c in route.calls]
+    assert preview["file"] == {"filename": "tutor.h5p", "source": "base64", "size_bytes": len(H5P)}
+    assert preview["module"]["modname"] == "h5pactivity"
+    assert out == {"ok": True, "cmid": 78, "instance": 9, "modname": "h5pactivity", "size_bytes": len(H5P)}
+    assert [c["wsfunction"] for c in calls] == [
+        "core_webservice_get_site_info",
+        "core_files_upload",
+        "local_grokbot_create_module",
+    ]
+    assert calls[1]["filename"] == "tutor.h5p" and base64.b64decode(calls[1]["filecontent"]) == H5P
+    assert calls[2]["modname"] == "h5pactivity"
+    assert json.loads(calls[2]["settings"]) == {
+        "grade": 100, "completion": 2, "completionusegrade": 1, "completionpassgrade": 1, "gradepass": 60,
+        "packagefile": 555,
+    }  # fmt: skip
