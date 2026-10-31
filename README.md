@@ -29,7 +29,7 @@ flowchart LR
   G[Grok Bot / MCP 클라이언트] -- stdio --> R[mcp-remote 래퍼]
   R -- "HTTPS + Bearer<br/>Streamable HTTP /mcp" --> N[nginx / Cloudflare]
   N --> S[Moodle MCP 서버<br/>Docker · 127.0.0.1:8791]
-  S -- "REST wstoken<br/>core_* / mod_*" --> M[(Moodle 5.x<br/>Web Services)]
+  S -- "REST wstoken<br/>core_* / mod_*" --> M[(Moodle 5.3+<br/>Web Services)]
   S -- "REST wstoken<br/>local_grokbot_*" --> P[local_grokbot 플러그인]
   P --- M
 ```

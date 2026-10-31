@@ -5,7 +5,7 @@
 ## 0. 요구사항
 | 항목 | 내용 |
 |---|---|
-| Moodle | **5.1 이상**, 이미 설치되어 동작 중이어야 함 (`local_grokbot` requires 2025100600). 검증: 5.3 (Build 20261005, 운영) · 5.3+ (Build 20261030, 새 Ubuntu 24.04 서버에 nginx + PHP 8.3-FPM + PostgreSQL 17로 처음부터 설치) |
+| Moodle | **5.3 LTS 이상** (5.1·5.2·4.5 미지원), 이미 설치되어 동작 중이어야 함 (`local_grokbot` requires 2026100500). 검증: 5.3 (Build 20261005, 운영) · 5.3+ (Build 20261030, 새 Ubuntu 24.04 서버에 nginx + PHP 8.3-FPM + PostgreSQL 17로 처음부터 설치) |
 | 필수 플러그인 | `local_grokbot` (이 리포 `plugins/local_grokbot`) |
 | 선택 플러그인 | `mod_attendance` (→ `attendance_sessions`), `mod_openmaic` (→ `create_openmaic`, 별도 배포·이 리포 미포함). 없어도 설치/동작에 문제 없음 |
 | 코어 모듈 | assign, quiz, forum, page, resource, workshop, wiki, glossary, feedback, h5pactivity (기본 활성) |
