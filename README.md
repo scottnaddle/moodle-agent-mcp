@@ -1,24 +1,39 @@
-# Moodle Agent (Grok Bot × Moodle MCP)
+# Moodle Agent MCP — 설치 키트
 
-> COURSEMOS팀 공유용 리포입니다. Grok Bot이 Moodle 강좌를 읽고, 만들고, 채점까지 돕도록 만든 MCP 서버와 동반 Moodle 플러그인을 한 곳에 모았어요. 토큰·비밀값·실서버 주소는 전부 빼거나 placeholder로 바꿨습니다.
+> 우리 Moodle에 **AI 에이전트(Grok Bot 등 MCP 클라이언트)**를 붙여서 강좌 조회·생성·채점까지 바로 쓸 수 있게 해 주는 키트입니다. COURSEMOS팀 공유용. 토큰·비밀값·실서버 주소는 들어 있지 않아요.
 
-## 개요
-- **`src/moodle_mcp/`** — FastMCP(Python 3.12) 기반 Streamable-HTTP MCP 서버. Moodle 도구 **39개**(읽기 14 · 쓰기 25)를 노출하고, Bearer 토큰으로 보호합니다.
-- **`plugins/local_grokbot/`** — 서버가 의존하는 Moodle 로컬 플러그인(v0.3.0, 웹서비스 함수 9개). 코어 WS에 없는 기능(모듈 생성/수정, 루브릭, 성적 카테고리, 배지 등)을 채워 줍니다.
-- **`docs/`** — 통합 설계 메모, 공유 브리프, 강좌 8 데모 정리, 강좌 설계 자료(`moodle-design/`).
-- 쓰기 도구는 전부 `confirm=false`로 미리보기 → 교사 승인 → `confirm=true`로 실행하는 2단계 방식입니다. (`grade_submission`/`bulk_grade`는 confirm 인자 없이 승인 후 호출)
+## 들어 있는 것
+| 경로 | 내용 |
+|---|---|
+| `src/moodle_mcp/`, `tests/` | FastMCP(Python 3.12) Streamable-HTTP MCP 서버 — 도구 **39개**, Bearer 인증 |
+| `Dockerfile`, `deploy/docker-compose.yml`, `.env.example` | 컨테이너 빌드/실행 |
+| `plugins/local_grokbot/` | 서버가 의존하는 Moodle 로컬 플러그인 (v0.3.0, WS 함수 9개) |
+| `moodle-setup/setup_grokbot_ws.php` | Moodle 쪽 자동 설정 CLI (웹서비스·REST·서비스 사용자·역할·외부 서비스·토큰) |
+| `deploy/nginx/mcp.conf.template`, `deploy/TLS_CLOUDFLARE.md` | 리버스 프록시·TLS 템플릿 (도메인은 변수) |
+| `client/moodle-mcp-remote.sh` | Grok Bot/아무 MCP 클라이언트용 stdio 래퍼 (mcp-remote) |
+| `scripts/smoke_test.py` | 설치 후 동작 확인 |
+| `INSTALL.md`, `ROLLBACK.md` | 설치 전 과정 / 업그레이드·롤백 |
+| `docs/` | 통합 설계 메모, 프로젝트 브리프, 서버 영문 README |
+
+👉 **설치는 [INSTALL.md](INSTALL.md)를 순서대로 따라가면 됩니다.**
 
 ## 아키텍처
 ```mermaid
 flowchart LR
-  G[Grok Bot] -- MCP stdio --> R[mcp-remote]
-  R -- "HTTPS + Bearer<br/>Streamable HTTP /mcp" --> S[Moodle MCP 서버<br/>FastMCP · Docker]
+  G[Grok Bot / MCP 클라이언트] -- stdio --> R[mcp-remote 래퍼]
+  R -- "HTTPS + Bearer<br/>Streamable HTTP /mcp" --> N[nginx / Cloudflare]
+  N --> S[Moodle MCP 서버<br/>Docker · 127.0.0.1:8791]
   S -- "REST wstoken<br/>core_* / mod_*" --> M[(Moodle 5.x<br/>Web Services)]
   S -- "REST wstoken<br/>local_grokbot_*" --> P[local_grokbot 플러그인]
   P --- M
 ```
 
 ## 도구 목록 (39)
+- 읽기 14 · 쓰기 25. 쓰기 도구는 `confirm=false` 미리보기 → 사람 승인 → `confirm=true` 실행의 2단계입니다. (`grade_submission`/`bulk_grade`는 confirm 인자 없이 승인 후 호출)
+- ⚠️선택 = 선택 플러그인이 필요한 도구. 플러그인이 없어도 서버·설정 스크립트는 정상 동작하고, 해당 도구만 `error` + `hint`를 돌려줍니다.
+  - `attendance_sessions` → **mod_attendance**
+  - `create_openmaic` → **mod_openmaic**
+
 | # | 이름 | 종류 | 설명 |
 |---|---|---|---|
 | 1 | `site_info` | 읽기 | Get Moodle site info and the identity of the web service user. |
@@ -32,7 +47,7 @@ flowchart LR
 | 9 | `list_quizzes` | 읽기 | List quizzes in the given courses (omit for all accessible courses). |
 | 10 | `list_quiz_attempts` | 읽기 | List a user's attempts on a quiz. |
 | 11 | `review_attempt` | 읽기 | Get the full review (questions, responses, marks) of a quiz attempt. |
-| 12 | `attendance_sessions` | 읽기 | List sessions (and attendance logs) of an attendance activity instance. |
+| 12 | `attendance_sessions` ⚠️선택 | 읽기 | List sessions (and attendance logs) of an attendance activity instance. |
 | 13 | `list_categories` | 읽기 | List course categories (id, name, parent, coursecount). |
 | 14 | `create_course` | 쓰기 | Create a course (core_course_create_courses) and enrol the bot as editingteacher. |
 | 15 | `grade_submission` | 쓰기 | Save a grade and feedback comment for one student's assignment submission. |
@@ -47,7 +62,7 @@ flowchart LR
 | 24 | `create_glossary` | 쓰기 | . |
 | 25 | `create_feedback` | 쓰기 | . |
 | 26 | `create_h5pactivity` | 쓰기 | . |
-| 27 | `create_openmaic` | 쓰기 | . |
+| 27 | `create_openmaic` ⚠️선택 | 쓰기 | . |
 | 28 | `set_rubric` | 쓰기 | Define (or replace) the rubric of an activity. |
 | 29 | `set_grade_categories` | 쓰기 | Organise the gradebook into weighted categories under the course total and move activities' grade items into them. |
 | 30 | `create_badge` | 쓰기 | Create a course badge awarded when all activity_cmids are completed and/or the course is completed with at least min_course_grade. |
@@ -61,46 +76,10 @@ flowchart LR
 | 38 | `post_forum_discussion` | 쓰기 | Post a new discussion to a forum (forum_id = forum instance id). |
 | 39 | `list_forum_discussions` | 읽기 | List the discussions of a forum (forum instance id) with all their posts. |
 
-## 설치 / 배포
-### 1. Moodle 쪽 준비
-1. `plugins/local_grokbot`을 Moodle의 `local/grokbot`에 복사 → 관리자 화면에서 업그레이드(알림) 실행.
-2. 사이트 관리 → 고급 기능 → **웹 서비스 활성화**, 관리 → 플러그인 → 웹 서비스 → **REST 프로토콜 활성화**.
-3. 전용 서비스 사용자(예: `svc_grokbot`) 생성. admin 계정 토큰은 쓰지 마세요.
-4. 외부 서비스 생성(읽기용/쓰기용 분리 권장) → 필요한 `core_*`, `mod_*`, `local_grokbot_*` 함수 추가 → 허가된 사용자에 서비스 사용자 등록.
-5. 서비스 사용자에 맞는 역할/권한 부여 후 **토큰 발급**(관리 → 웹 서비스 → 토큰 관리).
-
-### 2. MCP 서버 실행 (docker compose)
-```bash
-cp .env.example .env      # 값 채우기 (커밋 금지)
-#  MOODLE_WS_ENDPOINT=https://moodle.example.com/webservice/rest/server.php
-#  MOODLE_TOKEN=<서비스 사용자 토큰>
-#  MCP_BEARER_TOKEN=<길고 랜덤한 값, 예: openssl rand -hex 32>
-#  MCP_PORT=8791
-docker build -t moodle-mcp:p0 .
-cp .env deploy/.env && cd deploy && docker compose up -d
-curl http://localhost:8791/health
-```
-- compose는 `localhost`에만 바인딩하니, 외부 공개는 리버스 프록시(nginx/Caddy 등, TLS)로 `https://mcp.example.com/mcp` 형태로 열어 주세요.
-- 로컬 개발: `pip install -r requirements-dev.txt && pytest`.
-
-### 3. Grok Bot 연결
-```bash
-npx mcp-remote https://mcp.example.com/mcp --header "Authorization: Bearer ${MCP_BEARER_TOKEN}"
-```
-커넥터 도구 목록은 앱이 캐시하므로, 도구를 추가/변경하면 커넥터를 다시 추가해야 반영됩니다.
-
-## 데모 시나리오 — 강좌 8 「AI 에이전트 시대의 교육」
-자세한 내용은 [`docs/course8_share.md`](docs/course8_share.md).
-1. 교사가 "테스트 강좌 만들어 줘" → `list_categories` + `create_course` 미리보기 → 승인 → 강좌 생성.
-2. AI교수법 조교가 8차시 설계안 작성, 슬라이드 에이전트가 덱 8개(pptx+pdf) 제작 (`docs/moodle-design/`).
-3. 무들봇이 81단계 빌드 계획을 단계별 미리보기로 제시 → 교사 승인.
-4. 실행: `add_sections`/`update_section` → 차시별 `create_page`·`create_resource` → 퀴즈(`create_quiz`+`add_quiz_questions`), 포럼, 위키, 용어집, 과제, 워크숍, 설문, OpenMAIC 활동 → `set_rubric`·`set_completion`·`set_access_restriction`(순차 잠금)·`set_grade_categories`·`create_badge`.
-5. 결과: 약 10분 만에 전체 빌드, 오류 0건.
-
 ## 관련 작업
-- **mod_openmaic**(OpenMAIC Moodle 플러그인)은 별도로 관리되며 이 리포에는 포함되지 않습니다. 여기서는 `create_openmaic` 도구가 이미 설치된 모듈을 호출만 합니다.
+- **mod_openmaic**(OpenMAIC 기반 멀티에이전트 강의 Moodle 활동 플러그인)은 별도로 관리되며 이 리포에는 포함되지 않습니다. 설치돼 있으면 `create_openmaic`이 그 모듈을 만들어 줄 뿐입니다. 필요하면 담당자에게 따로 요청해 주세요.
 
-## 참고
-- 스크린샷은 관리자 이름이 노출돼 있고 크롭본이 없어 제외했습니다.
-- 강의 영상(약 1.9GB)과 base64 중간 산출물은 용량 문제로 제외했습니다.
-- 서버 원본 영문 README: [`docs/SERVER_README_en.md`](docs/SERVER_README_en.md)
+## 보안 원칙 (요약)
+- 토큰/`.env`는 절대 커밋하지 않기 (`.gitignore`에 포함). admin 토큰·`moodle_mobile_app` 토큰을 MCP에 쓰지 않기.
+- 전용 서비스 사용자 + 제한된 외부 서비스(`restrictedusers=1`) + 가능하면 IP 제한.
+- 실제 학생 데이터에 쓰기 전에 테스트 강좌/스테이징에서 먼저 확인. 자세한 내용은 INSTALL.md 7절.

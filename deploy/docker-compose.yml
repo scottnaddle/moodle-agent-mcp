@@ -1,9 +1,11 @@
+# Run from this directory with a filled-in .env next to it (cp ../.env.example .env).
+# IMAGE_TAG lets you pin/roll back: IMAGE_TAG=2026-10-31 docker compose up -d
 services:
   moodle-mcp:
-    image: moodle-mcp:p0
+    image: moodle-mcp:${IMAGE_TAG:-latest}
     container_name: moodle-mcp
     env_file: .env
     ports:
-      - "127.0.0.1:8791:8791"
+      - "127.0.0.1:${MCP_PORT:-8791}:${MCP_PORT:-8791}"
     mem_limit: 256m
     restart: unless-stopped

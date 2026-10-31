@@ -21,6 +21,10 @@ from .moodle import MoodleClient, MoodleError
 
 logger = logging.getLogger(__name__)
 
+OPTIONAL_HINT = (
+    "This tool needs the optional Moodle plugin {plugin}. If it is not installed (or its web service functions "
+    "are not in the external service), this tool cannot work; all other tools are unaffected."
+)
 EDITINGTEACHER_ROLE_ID = int(os.environ.get("MOODLE_EDITINGTEACHER_ROLE_ID", "3"))
 WRITE_NOTE = "WRITE - only call after the teacher confirmed."
 CONFIRM_NOTE = "Call first with confirm=false to get a preview; call again with confirm=true after the teacher agrees."
@@ -246,7 +250,10 @@ def create_mcp(client: MoodleClient) -> FastMCP:
     @mcp.tool()
     async def attendance_sessions(attendance_id: int) -> dict[str, Any]:
         """List sessions (and attendance logs) of an attendance activity instance."""
-        return await call("mod_attendance_get_sessions", key="sessions", attendanceid=attendance_id)
+        res = await call("mod_attendance_get_sessions", key="sessions", attendanceid=attendance_id)
+        if isinstance(res, dict) and "error" in res:
+            res["hint"] = OPTIONAL_HINT.format(plugin="mod_attendance")
+        return res
 
     @mcp.tool()
     async def list_categories() -> dict[str, Any]:
@@ -718,7 +725,10 @@ def create_mcp(client: MoodleClient) -> FastMCP:
         if completion_min_progress > 0:
             module.update(completion=2, completionminprogress=completion_min_progress)
         settings = {**module, **settings}
-        return await create_module(course_id, section, "openmaic", name, intro, visible, settings, confirm)
+        res = await create_module(course_id, section, "openmaic", name, intro, visible, settings, confirm)
+        if isinstance(res, dict) and "error" in res:
+            res["hint"] = OPTIONAL_HINT.format(plugin="mod_openmaic")
+        return res
 
     @mcp.tool(
         description=f"{WRITE_NOTE} Define (or replace) the rubric of an activity. {CONFIRM_NOTE} "
