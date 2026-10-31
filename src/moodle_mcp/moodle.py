@@ -57,7 +57,7 @@ class MoodleClient:
     def __init__(
         self,
         endpoint: str,
-        token: str,
+        token: str | bytes | bytearray,
         *,
         timeout: httpx.Timeout | float = DEFAULT_TIMEOUT,
         transport: httpx.AsyncBaseTransport | None = None,
@@ -74,10 +74,11 @@ class MoodleClient:
         if not self.endpoint or not self._token:
             raise MoodleError("Moodle is not configured (MOODLE_WS_ENDPOINT / MOODLE_TOKEN missing)")
 
+        token = self._token.decode() if isinstance(self._token, (bytes, bytearray)) else self._token
         data = flatten_params(params)
         data.update(
             {
-                "wstoken": self._token,
+                "wstoken": token,
                 "wsfunction": wsfunction,
                 "moodlewsrestformat": "json",
             }
@@ -103,5 +104,5 @@ class MoodleClient:
         if isinstance(result, dict) and "exception" in result:
             errorcode = result.get("errorcode")
             message = result.get("message", "")
-            raise MoodleError(f"{wsfunction}: [{errorcode}] {message}".replace(self._token, "***"), errorcode)
+            raise MoodleError(f"{wsfunction}: [{errorcode}] {message}".replace(token, "***"), errorcode)
         return result

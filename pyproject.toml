@@ -14,6 +14,7 @@ dependencies = [
     "uvicorn>=0.30,<1",
     "starlette>=0.40",
     "pydantic>=2.7,<3",
+    "cryptography>=43,<46",
 ]
 
 [project.optional-dependencies]
@@ -25,11 +26,13 @@ test = [
 
 [project.scripts]
 moodle-mcp = "moodle_mcp.__main__:main"
+moodle-hub-admin = "moodle_mcp.admin:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"

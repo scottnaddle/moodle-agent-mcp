@@ -1,10 +1,12 @@
 import base64
 import json
+import socket
 
 import httpx
 import pytest
 import respx
 
+import moodle_mcp.server as server_module
 from moodle_mcp.moodle import MoodleClient
 from moodle_mcp.server import _download, _video_embed, create_mcp
 
@@ -15,6 +17,14 @@ from .test_moodle import form
 @pytest.fixture
 def mcp():
     return create_mcp(MoodleClient(ENDPOINT, MOODLE_TOKEN))
+
+
+@pytest.fixture
+def public_dns(monkeypatch):
+    def resolve(host, port):
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("93.184.216.34", port))]
+
+    monkeypatch.setattr(server_module, "_resolve_host", resolve)
 
 
 def routed(replies):
@@ -493,7 +503,7 @@ async def test_create_resource_base64_uploads_then_creates(mcp):
     assert json.loads(create["settings"]) == {"completion": 2, "completionview": 1, "files": 555}
 
 
-async def test_create_resource_downloads_file_url(mcp):
+async def test_create_resource_downloads_file_url(mcp, public_dns):
     args = {**MODULE, "filename": "notes.pdf", "file_url": "https://files.test/notes.pdf", "completion_view": False}
     with respx.mock:
         download = respx.get("https://files.test/notes.pdf").respond(content=PDF)
@@ -528,7 +538,7 @@ async def test_create_resource_upload_error_stops(mcp):
     assert "fileexist" in out["error"]
 
 
-async def test_download_enforces_limit_and_scheme():
+async def test_download_enforces_limit_and_scheme(public_dns):
     with respx.mock:
         respx.get("https://files.test/big").respond(content=b"x" * 11)
         with pytest.raises(ValueError, match="larger"):
