@@ -151,6 +151,66 @@ def test_forced_collision_is_ambiguous_and_unresolved(monkeypatch):
     assert p.restore(first) == first
 
 
+def test_course_fields_are_not_field_masked_but_users_are():
+    p = Pseudonymizer()
+    payload = {
+        "courses": [
+            {
+                "id": 5,
+                "fullname": "데이터과학 입문",
+                "shortname": "DS101",
+                "assignments": [{"id": 9, "name": "Week 1 essay"}],
+            }
+        ],
+        "users": [
+            {
+                "id": 7,
+                "fullname": "김민수",
+                "email": "kim@example.com",
+                "idnumber": "20231234",
+            }
+        ],
+    }
+
+    masked = p.pseudonymize_value(payload)
+
+    assert masked["courses"][0]["fullname"] == "데이터과학 입문"
+    assert masked["courses"][0]["shortname"] == "DS101"
+    assert NAME_RE.fullmatch(masked["users"][0]["fullname"])
+    assert EMAIL_RE.fullmatch(masked["users"][0]["email"])
+    assert STUDENT_ID_RE.fullmatch(masked["users"][0]["idnumber"])
+
+
+def test_user_like_objects_are_detected_by_marker_keys_and_containers():
+    p = Pseudonymizer()
+    payload = {
+        "id": 1,
+        "fullname": "데이터과학 입문",
+        "shortname": "DS101",
+        "category": {"id": 2, "fullname": "공학", "shortname": "ENG"},
+        "author": {"id": 7, "fullname": "김민수"},
+        "participants": [{"id": 8, "fullname": "홍길동"}],
+    }
+
+    masked = p.pseudonymize_value(payload)
+
+    assert masked["fullname"] == "데이터과학 입문"
+    assert masked["shortname"] == "DS101"
+    assert masked["category"]["fullname"] == "공학"
+    assert NAME_RE.fullmatch(masked["author"]["fullname"])
+    assert NAME_RE.fullmatch(masked["participants"][0]["fullname"])
+
+
+def test_top_level_user_markers_enable_field_masking():
+    p = Pseudonymizer()
+    masked = p.pseudonymize_value(
+        {"fullname": "김민수", "email": "kim@example.com", "idnumber": "20231234"}
+    )
+    assert NAME_RE.fullmatch(masked["fullname"])
+    assert EMAIL_RE.fullmatch(masked["email"])
+    assert STUDENT_ID_RE.fullmatch(masked["idnumber"])
+
+
 def test_pseudonymize_restore_does_not_log_pii(caplog):
     caplog.set_level(logging.DEBUG)
     p = Pseudonymizer()

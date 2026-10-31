@@ -34,6 +34,7 @@ from .crypto import (
     load_kek,
 )
 from .moodle import MoodleClient, MoodleError
+from .netutil import parse_ip_list
 from .pseudonym import Pseudonymizer, RegistryPseudonymMap
 from .registry import DuplicateSite, Registry, TenantError, normalize_moodle_url, ws_endpoint
 
@@ -124,10 +125,17 @@ WRITE_FUNCTIONS = frozenset(
     }
 )
 _LOCAL_WRITE_PREFIX = "local_ubionai_"
+_LOCAL_READ_FUNCTIONS = frozenset({"local_ubionai_get_course_assignments"})
 
 
 def _is_write(wsfunction: str) -> bool:
-    return wsfunction in WRITE_FUNCTIONS or wsfunction.startswith(_LOCAL_WRITE_PREFIX)
+    return (
+        wsfunction in WRITE_FUNCTIONS
+        or (
+            wsfunction.startswith(_LOCAL_WRITE_PREFIX)
+            and wsfunction not in _LOCAL_READ_FUNCTIONS
+        )
+    )
 
 
 class GradeEntry(BaseModel):
@@ -396,8 +404,42 @@ def create_mcp(client: MoodleClient | None) -> FastMCP:
 
     @mcp.tool()
     async def list_assignments(course_ids: list[int] | None = None) -> dict[str, Any]:
-        """List assignments, grouped by course. Omit course_ids for all accessible courses."""
-        return await call("mod_assign_get_assignments", courseids=course_ids or None)
+        """List assignments, grouped by course. Omit course_ids for all accessible courses.
+
+        Courses the service user is not enrolled in are fetched via the optional
+        local_ubionai_get_course_assignments fallback (tagged source=local_ubionai).
+        """
+        res = await call("mod_assign_get_assignments", courseids=course_ids or None)
+        if not isinstance(res, dict) or "error" in res:
+            return res
+
+        fallback_errors: list[dict[str, Any]] = []
+        missing: list[int] = []
+        if isinstance(res.get("courses"), list):
+            seen = {int(c["id"]) for c in res["courses"] if isinstance(c, dict) and "id" in c}
+            missing = [cid for cid in (course_ids or []) if cid not in seen]
+
+        for courseid in missing:
+            extra = await call("local_ubionai_get_course_assignments", courseid=courseid)
+            if isinstance(extra, dict) and "error" not in extra:
+                for course in extra.get("courses", []):
+                    if isinstance(course, dict):
+                        course["source"] = "local_ubionai"
+                        res.setdefault("courses", []).append(course)
+                res.setdefault("warnings", []).extend(extra.get("warnings", []))
+            else:
+                error = extra.get("error") if isinstance(extra, dict) else str(extra)
+                fallback_errors.append({"courseid": courseid, "error": str(error)})
+                res["hint"] = OPTIONAL_HINT.format(plugin="local_ubionai")
+
+        if fallback_errors:
+            res["fallback_errors"] = fallback_errors
+        if not course_ids and not res.get("courses"):
+            res["hint"] = (
+                "No courses returned; the service user is not enrolled in any course. "
+                "Pass course_ids to list assignments for specific courses."
+            )
+        return res
 
     @mcp.tool()
     async def get_submissions(assignment_ids: list[int], status: str = "") -> dict[str, Any]:
@@ -1714,7 +1756,10 @@ def create_app(
         raise RuntimeError("global Moodle credentials are not allowed in multi-tenant mode")
 
     public_url = (os.environ.get("UBIONAI_HUB_PUBLIC_URL") or "").rstrip("/")
-    egress_ip = os.environ.get("UBIONAI_HUB_EGRESS_IP") or None
+    try:
+        egress_ip = parse_ip_list(os.environ.get("UBIONAI_HUB_EGRESS_IP"))
+    except ValueError as exc:
+        raise RuntimeError(f"UBIONAI_HUB_EGRESS_IP invalid: {exc}") from None
 
     mcp = create_mcp(None)
     inner = RegisterEndpoint(

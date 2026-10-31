@@ -26,7 +26,7 @@ def build(tmp_path, monkeypatch):
     monkeypatch.delenv("MCP_BEARER_TOKEN", raising=False)
     monkeypatch.delenv("UBIONAI_HUB_ALLOW_HTTP", raising=False)
     monkeypatch.setenv("UBIONAI_HUB_PUBLIC_URL", "https://hub.test")
-    monkeypatch.setenv("UBIONAI_HUB_EGRESS_IP", "203.0.113.9")
+    monkeypatch.setenv("UBIONAI_HUB_EGRESS_IP", "203.0.113.10, 2001:DB8::/32,203.0.113.10")
     kek_file = tmp_path / "kek"
     kek_file.write_bytes(base64.b64encode(os.urandom(32)) + b"\n")
     os.chmod(kek_file, 0o600)
@@ -52,7 +52,7 @@ def test_valid_registration_and_bearer_works(tmp_path, monkeypatch):
         data = response.json()
         assert data["site_id"] == "reg-a"
         assert data["mcp_endpoint"] == "https://hub.test/t/reg-a/mcp"
-        assert data["egress_ip"] == "203.0.113.9"
+        assert data["egress_ip"] == "203.0.113.10,2001:db8::/32"
         assert data["mcp_bearer"]
 
         response = live.post(

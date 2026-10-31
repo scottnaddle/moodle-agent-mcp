@@ -27,7 +27,7 @@ Token values are never logged or included in error messages. See `.env.example`;
 | `list_courses(ids=None)` | `core_course_get_courses` (`options[ids]`) |
 | `get_course_outline(course_id)` | `core_course_get_contents` |
 | `list_students(course_id)` | `core_enrol_get_enrolled_users` |
-| `list_assignments(course_ids=None)` | `mod_assign_get_assignments` |
+| `list_assignments(course_ids=None)` | `mod_assign_get_assignments`; courses outside the service user's enrolment fall back to `local_ubionai_get_course_assignments` and are tagged `source: local_ubionai` |
 | `get_submissions(assignment_ids, status="")` | `mod_assign_get_submissions` |
 | `gradebook_overview(course_id, user_id=None)` | `gradereport_user_get_grade_items` |
 | `list_quizzes(course_ids=None)` | `mod_quiz_get_quizzes_by_courses` |
