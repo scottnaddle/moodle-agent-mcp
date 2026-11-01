@@ -463,13 +463,19 @@ async def test_seeding_failure_masks_student_name_in_assignment_title():
     assert calls[-1]["courseid"] == "5"
 
 
+ORDINARY_TITLES = ["조별 과제", "1주차 보고서", "중간고사 대비 정리", "강의 요약 과제"]
+
+
 async def test_ordinary_assignment_title_stays_readable():
     page = {
         "courses": [
             {
                 "id": 5,
                 "fullname": "Course",
-                "assignments": [{"id": 9, "name": "조별 과제"}],
+                "assignments": [
+                    {"id": 9 + index, "name": title}
+                    for index, title in enumerate(ORDINARY_TITLES)
+                ],
             }
         ],
         "total": 1,
@@ -489,8 +495,201 @@ async def test_ordinary_assignment_title_stays_readable():
     finally:
         _current_pseudonymizer.reset(token)
     rendered = json.dumps(result, ensure_ascii=False)
-    assert result["courses"][0]["assignments"][0]["name"] == "조별 과제"
+    assert [a["name"] for a in result["courses"][0]["assignments"]] == ORDINARY_TITLES
     assert PLACEHOLDER_RE.search(rendered) is None
+
+
+# Names below are not enrolled anywhere, so only the title heuristic can mask them.
+UNSEEDED_TITLES = {
+    9: ("김철수 박사 특강 감상문", "김철수", " 박사 특강 감상문"),
+    10: ("[이영희] 보충과제", "이영희", "] 보충과제"),
+    11: ("박민수_기말보고서", "박민수", "_기말보고서"),
+}
+OTHER_STUDENT = [{"id": 7, "fullname": "최지우", "firstname": "지우", "lastname": "최"}]
+
+
+def _unseeded_course(courseid=5):
+    return {
+        "id": courseid,
+        "fullname": "Course",
+        "assignments": [
+            {"id": aid, "name": title} for aid, (title, _, _) in UNSEEDED_TITLES.items()
+        ],
+    }
+
+
+def _assert_unseeded_names_masked(result):
+    rendered = json.dumps(result, ensure_ascii=False)
+    names = {a["id"]: a["name"] for c in result["courses"] for a in c["assignments"]}
+    for aid, (_title, name, rest) in UNSEEDED_TITLES.items():
+        assert name not in rendered
+        assert PLACEHOLDER_RE.search(names[aid])
+        assert names[aid].endswith(rest)
+
+
+async def test_unseeded_names_in_titles_are_masked_without_course_ids():
+    page = {"courses": [_unseeded_course()], "total": 1, "warnings": []}
+    token = _current_pseudonymizer.set(Pseudonymizer())
+    try:
+        result, _calls = await call_list_assignments(
+            {
+                "mod_assign_get_assignments": {"courses": [], "warnings": []},
+                "local_ubionai_list_course_assignments": page,
+                "core_enrol_get_enrolled_users": OTHER_STUDENT,
+            }
+        )
+    finally:
+        _current_pseudonymizer.reset(token)
+    _assert_unseeded_names_masked(result)
+
+
+async def test_unseeded_names_in_titles_are_masked_with_course_ids():
+    token = _current_pseudonymizer.set(Pseudonymizer())
+    try:
+        result, _calls = await call_list_assignments(
+            {
+                "mod_assign_get_assignments": {"courses": [], "warnings": []},
+                "local_ubionai_get_course_assignments": {
+                    "courses": [_unseeded_course()],
+                    "warnings": [],
+                },
+                "core_enrol_get_enrolled_users": OTHER_STUDENT,
+            },
+            course_ids=[5],
+        )
+    finally:
+        _current_pseudonymizer.reset(token)
+    _assert_unseeded_names_masked(result)
+
+
+async def test_title_masking_does_not_depend_on_cached_names():
+    key = b"k" * 32
+    title_page = {"courses": [_unseeded_course(5)], "total": 1, "warnings": []}
+    other_page = {
+        "courses": [{"id": 6, "fullname": "Six", "assignments": [{"id": 1, "name": "과제"}]}],
+        "total": 1,
+        "warnings": [],
+    }
+
+    def enrolled(data):
+        if data["courseid"] == "6":
+            # Course 6 enrols the people named in course 5's titles.
+            return [
+                {"id": 1, "fullname": "김철수", "firstname": "철수", "lastname": "김"},
+                {"id": 2, "fullname": "이영희", "firstname": "영희", "lastname": "이"},
+                {"id": 3, "fullname": "박민수", "firstname": "민수", "lastname": "박"},
+            ]
+        return OTHER_STUDENT
+
+    async def run(pseudonymizer, page):
+        token = _current_pseudonymizer.set(pseudonymizer)
+        try:
+            result, _calls = await call_list_assignments(
+                {
+                    "mod_assign_get_assignments": {"courses": [], "warnings": []},
+                    "local_ubionai_list_course_assignments": page,
+                    "core_enrol_get_enrolled_users": enrolled,
+                }
+            )
+        finally:
+            _current_pseudonymizer.reset(token)
+        return result
+
+    fresh = await run(Pseudonymizer(key), title_page)
+    reused = Pseudonymizer(key)
+    await run(reused, other_page)
+    again = await run(reused, title_page)
+    assert fresh == again
+    _assert_unseeded_names_masked(fresh)
+
+
+async def test_seed_calls_request_name_fields_only():
+    page = {
+        "courses": [
+            {"id": 5, "fullname": "Five", "assignments": [{"id": 9, "name": "과제"}]},
+            {"id": 6, "fullname": "Six", "assignments": [{"id": 10, "name": "과제"}]},
+        ],
+        "total": 2,
+        "warnings": [],
+    }
+    token = _current_pseudonymizer.set(Pseudonymizer())
+    try:
+        _result, calls = await call_list_assignments(
+            {
+                "mod_assign_get_assignments": {"courses": [], "warnings": []},
+                "local_ubionai_list_course_assignments": page,
+                "core_enrol_get_enrolled_users": OTHER_STUDENT,
+            }
+        )
+    finally:
+        _current_pseudonymizer.reset(token)
+    seeds = [call for call in calls if call["wsfunction"] == "core_enrol_get_enrolled_users"]
+    assert sorted(call["courseid"] for call in seeds) == ["5", "6"]
+    for call in seeds:
+        assert call["options[0][name]"] == "userfields"
+        assert call["options[0][value]"] == "id,firstname,lastname,fullname"
+        assert "onlyactive" not in json.dumps(call)
+
+
+async def test_one_failed_seed_among_many_keeps_full_heuristic():
+    page = {
+        "courses": [
+            {"id": 5, "fullname": "Five", "assignments": [{"id": 9, "name": "김민수essay"}]},
+            {"id": 6, "fullname": "Six", "assignments": [{"id": 10, "name": "과제"}]},
+        ],
+        "total": 2,
+        "warnings": [],
+    }
+    seed_error = {
+        "exception": "moodle_exception",
+        "errorcode": "nopermission",
+        "message": "no",
+    }
+
+    def enrolled(data):
+        return seed_error if data["courseid"] == "6" else OTHER_STUDENT
+
+    token = _current_pseudonymizer.set(Pseudonymizer())
+    try:
+        result, _calls = await call_list_assignments(
+            {
+                "mod_assign_get_assignments": {"courses": [], "warnings": []},
+                "local_ubionai_list_course_assignments": page,
+                "core_enrol_get_enrolled_users": enrolled,
+            }
+        )
+    finally:
+        _current_pseudonymizer.reset(token)
+    # "김민수essay" is only caught by the full heuristic, which applies because
+    # seeding course 6 failed.
+    assert "김민수" not in json.dumps(result, ensure_ascii=False)
+
+
+async def test_later_page_does_not_seed_core_courses():
+    primary = {
+        "courses": [{"id": 9, "fullname": "Nine", "assignments": [{"id": 1, "name": "과제"}]}],
+        "warnings": [],
+    }
+    page = {
+        "courses": [{"id": 10, "fullname": "Ten", "assignments": [{"id": 2, "name": "과제"}]}],
+        "total": 40,
+        "warnings": [],
+    }
+    token = _current_pseudonymizer.set(Pseudonymizer())
+    try:
+        result, calls = await call_list_assignments(
+            {
+                "mod_assign_get_assignments": primary,
+                "local_ubionai_list_course_assignments": page,
+                "core_enrol_get_enrolled_users": OTHER_STUDENT,
+            },
+            offset=25,
+        )
+    finally:
+        _current_pseudonymizer.reset(token)
+    seeds = [call["courseid"] for call in calls if call["wsfunction"] == "core_enrol_get_enrolled_users"]
+    assert seeds == ["10"]
+    assert [course["id"] for course in result["courses"]] == [10]
 
 
 async def test_section_and_module_names_still_use_the_heuristic():

@@ -13,7 +13,7 @@ import sys
 from datetime import datetime, timezone
 
 from .crypto import KekError, load_kek
-from .registry import Registry, TenantError
+from .registry import ASSIGNMENT_TITLE_HEURISTICS, Registry, TenantError
 
 
 def _read_secret(path: str) -> bytes:
@@ -93,6 +93,9 @@ def build_parser() -> argparse.ArgumentParser:
     rotate_flags.add_argument("--pseudonymize", dest="pseudonymize", action="store_true")
     rotate_flags.add_argument("--no-pseudonymize", dest="pseudonymize", action="store_false")
     rotate.set_defaults(pseudonymize=None)
+    rotate.add_argument(
+        "--assignment-title-heuristic", choices=ASSIGNMENT_TITLE_HEURISTICS
+    )
 
     disable = sub.add_parser("disable", help="disable a tenant")
     disable.add_argument("--site-id", required=True)
@@ -127,6 +130,7 @@ def _metadata(tenant) -> dict[str, object]:
         "has_litellm": tenant.litellm_ct is not None,
         "kek_id": tenant.kek_id,
         "pseudonymize": tenant.pseudonymize,
+        "assignment_title_heuristic": tenant.assignment_title_heuristic,
         "created_at": tenant.created_at,
         "updated_at": tenant.updated_at,
     }
@@ -173,6 +177,11 @@ def main(argv: list[str] | None = None) -> int:
                 changed = True
             if args.pseudonymize is not None:
                 registry.rotate_pseudonymize(args.site_id, args.pseudonymize)
+                changed = True
+            if args.assignment_title_heuristic is not None:
+                registry.set_assignment_title_heuristic(
+                    args.site_id, args.assignment_title_heuristic
+                )
                 changed = True
             if args.rotate_auth:
                 if not args.bearer_out:

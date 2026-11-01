@@ -124,6 +124,19 @@ def test_pseudonymize_flag_roundtrip(tmp_path):
     assert registry.get("site-b").pseudonymize is False
 
 
+def test_assignment_title_heuristic_roundtrip(tmp_path):
+    registry = make_registry(tmp_path)
+    registry.add("site-a", "https://a.example", b"token-a", None, "bearer-a")
+    assert registry.get("site-a").assignment_title_heuristic == "title"
+    registry.set_assignment_title_heuristic("site-a", "full")
+    assert registry.get("site-a").assignment_title_heuristic == "full"
+    registry.set_assignment_title_heuristic("site-a", "off")
+    assert registry.list()[0].assignment_title_heuristic == "off"
+    with pytest.raises(TenantError):
+        registry.set_assignment_title_heuristic("site-a", "loose")
+    assert registry.get("site-a").assignment_title_heuristic == "off"
+
+
 def test_schema_v1_migrates_to_v4(tmp_path):
     db = tmp_path / "old.sqlite3"
     with sqlite3.connect(db) as conn:
@@ -157,10 +170,12 @@ def test_schema_v1_migrates_to_v4(tmp_path):
     tenant = registry.get("old-site")
     assert tenant is not None
     assert tenant.pseudonymize is True
+    assert tenant.assignment_title_heuristic == "title"
     with sqlite3.connect(db) as conn:
         assert conn.execute("SELECT schema_version FROM meta").fetchone()[0] == 4
         columns = {row[1] for row in conn.execute("PRAGMA table_info(tenants)")}
         assert "pseudonymize" in columns
+        assert "assignment_title_heuristic" in columns
         tables = {
             row[0]
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")

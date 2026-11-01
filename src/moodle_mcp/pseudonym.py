@@ -20,7 +20,7 @@ import unicodedata
 from collections import OrderedDict
 from collections.abc import Iterable
 from functools import lru_cache
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 from .crypto import (
     PURPOSE_PSEUDONYM_HMAC,
@@ -66,12 +66,20 @@ _USER_MARKER_KEYS = frozenset(
 # including from heuristic name detection, unless the object is user-like.
 _PLAIN_OBJECT_FIELDS = frozenset({"fullname", "shortname"})
 # Assignment titles (only inside "assignments" lists of list_assignments
-# results): heuristic Korean-name detection causes false positives on activity
-# titles, so it is skipped for the assignment "name". Known names seeded from
-# the courses' enrolled users are still masked there. Every other title field
-# keeps the heuristic.
+# results): full heuristic Korean-name detection causes false positives on
+# activity titles, so the assignment "name" uses the tenant's
+# assignment_title_heuristic mode (default "title", a weaker heuristic).
+# Known names seeded from the courses' enrolled users are always masked there.
+# Every other title field keeps the full heuristic.
 _ASSIGNMENT_LIST_KEY = "assignments"
 _ASSIGNMENT_TITLE_KEY = "name"
+
+HeuristicMode = Literal["full", "title", "off"]
+HEURISTIC_MODES: tuple[str, ...] = ("full", "title", "off")
+DEFAULT_ASSIGNMENT_TITLE_HEURISTIC: HeuristicMode = "title"
+# Upper bound on seeded known names per pseudonymizer (least recently seeded
+# names are evicted first).
+KNOWN_NAMES_MAX = 50_000
 
 
 def _looks_like_user(value: object) -> bool:
@@ -176,6 +184,29 @@ _STOPWORDS = frozenset(
 )
 
 
+# Title mode only: activity vocabulary that starts with a surname syllable and
+# commonly stands alone in assignment titles ("조별 과제", "기말 보고서").
+_ACTIVITY_STOPWORDS = frozenset(
+    {
+        "주차", "주차별", "보고서", "과제", "발표", "실습", "기말", "중간", "정리", "제출",
+        "조별", "모둠", "모둠별", "감상", "감상문", "소감", "소감문", "소개", "요약", "문제",
+        "문제풀이", "연습", "연구", "설계", "사례", "계획", "계획서", "기획", "기획서", "성찰",
+        "마감", "복습", "예습", "진도", "피드백", "구현", "구상", "주제", "제안", "제안서",
+        "제목", "제작", "기초", "기본", "심화", "성적", "점수", "최종", "원고", "모의",
+        "공지", "공동", "공학", "기술", "기사", "도서", "문학", "문헌", "문법", "국어",
+        "사회", "경제", "경영", "정치", "지리", "음악", "가정", "기하", "함수", "방정식",
+        "계산", "인터뷰", "유튜브", "영상", "우리", "주간", "평가", "시험", "특강", "토론",
+        "실험", "탐구", "자료", "학습", "활동", "개인", "팀별", "수업", "강의", "강독",
+        "기타", "공통", "선택", "필수", "추가", "보충", "재제출", "연장", "진행", "준비",
+        "결과", "결과물", "분석", "정답", "해설", "구조", "방법", "변경", "선행", "전체",
+        "전공", "교양", "포트폴리오", "초안", "수정", "보완",
+    }
+)
+# Title mode: a candidate standing between these (or whitespace / string
+# boundaries) is treated as a name token.
+_TITLE_DELIMITERS = frozenset("_[]()-/")
+
+
 @lru_cache(maxsize=None)
 def _is_particle_word(word: str) -> bool:
     """True when the whole word can be segmented into particles (e.g. 이가)."""
@@ -259,6 +290,39 @@ def _heuristic_match_at(text: str, start: int) -> tuple[int, str, str] | None:
     return longest
 
 
+def _is_activity_word(word: str) -> bool:
+    """Activity vocabulary, optionally followed by particles (e.g. 조별로)."""
+    return any(
+        word[:end] in _ACTIVITY_STOPWORDS and _is_particle_word(word[end:])
+        for end in range(2, len(word) + 1)
+    )
+
+
+def _is_title_delimiter(char: str) -> bool:
+    return char in _TITLE_DELIMITERS or char.isspace()
+
+
+def _title_candidate(text: str, start: int, match: tuple[int, str, str]) -> bool:
+    """Weaker heuristic for activity titles.
+
+    A 2-3 syllable candidate (3-4 with a two-syllable surname) at the start of
+    a word is a name only if a title/particle follows it directly, or it stands
+    between delimiters (``_ [ ] ( ) - /``, whitespace or string boundaries).
+    Activity vocabulary is never a name.
+    """
+    given_len, candidate, after = match
+    if given_len > 2 or _is_activity_word(candidate):
+        return False
+    before = text[start - 1] if start > 0 else ""
+    if before and _hangul_only(before):
+        return False
+    if after and _starts_with_suffix(after):
+        return True
+    return (not before or _is_title_delimiter(before)) and (
+        not after or _is_title_delimiter(after[0])
+    )
+
+
 # Student ids: 7-10 bare digits, hyphenated ids such as 2023-12345, and
 # letter-prefixed ids such as S20231234 / ID20231234. Arbitrary longer runs and
 # ids embedded in larger alphanumeric tokens are left alone.
@@ -274,15 +338,28 @@ _PHONE_RE = re.compile(
 )
 
 
-def _known_pattern(name: str) -> re.Pattern[str]:
-    escaped = re.escape(name)
-    before = r"(?<![가-힣])" if _hangul_only(name[:1]) else r"(?<!\w)"
-    after = (
-        rf"(?=(?:{'|'.join(re.escape(suffix) for suffix in _SUFFIXES)}|[^가-힣]|$))"
-        if _hangul_only(name[-1:])
-        else r"(?!\w)"
-    )
-    return re.compile(before + escaped + after)
+def _is_word_char(char: str) -> bool:
+    return char.isalnum() or char == "_"
+
+
+def _known_before_ok(text: str, start: int) -> bool:
+    """A known name must not continue a preceding word (Hangul for Hangul names)."""
+    if start == 0:
+        return True
+    previous = text[start - 1]
+    if _hangul_only(text[start]):
+        return not _hangul_only(previous)
+    return not _is_word_char(previous)
+
+
+def _known_after_ok(text: str, end: int) -> bool:
+    """A Hangul-final name may only be followed by a particle/title or a
+    non-Hangul character; other names end at a word boundary."""
+    if end >= len(text):
+        return True
+    if _hangul_only(text[end - 1]):
+        return not _hangul_only(text[end]) or _starts_with_suffix(text[end:])
+    return not _is_word_char(text[end])
 
 
 def _field_category(key: str | None, name_keys: frozenset[str] = frozenset()) -> str | None:
@@ -291,7 +368,7 @@ def _field_category(key: str | None, name_keys: frozenset[str] = frozenset()) ->
     lowered = key.lower()
     if lowered in _NAME_FIELDS or lowered in name_keys:
         return "name"
-    if lowered == "idnumber":
+    if lowered in ("idnumber", "useridnumber"):
         return "student_id"
     if lowered in _EMAIL_FIELDS:
         return "email"
@@ -451,19 +528,77 @@ class Pseudonymizer:
         hmac_key: bytes | None = None,
         store: PseudonymMap | None = None,
         known_names: Iterable[str] = (),
+        *,
+        assignment_title_heuristic: HeuristicMode = DEFAULT_ASSIGNMENT_TITLE_HEURISTIC,
+        known_max: int = KNOWN_NAMES_MAX,
     ) -> None:
         self._key = bytes(hmac_key) if hmac_key is not None else os.urandom(32)
         self._store: PseudonymMap = store if store is not None else _MemoryPseudonymMap()
-        self._known: set[str] = set()
+        self._known: OrderedDict[str, None] = OrderedDict()
+        self._known_max = max(1, int(known_max))
+        # First character -> candidate name lengths, longest first. Lengths of
+        # evicted names may linger; they only cost a failed set lookup.
+        self._known_lengths: dict[str, tuple[int, ...]] = {}
         self._lock = threading.RLock()
+        self.assignment_title_heuristic = assignment_title_heuristic
         for name in known_names:
             self.add_known(name)
 
+    @property
+    def assignment_title_heuristic(self) -> HeuristicMode:
+        return self._assignment_title_heuristic
+
+    @assignment_title_heuristic.setter
+    def assignment_title_heuristic(self, mode: str) -> None:
+        if mode not in HEURISTIC_MODES:
+            raise ValueError("invalid assignment_title_heuristic")
+        self._assignment_title_heuristic = mode  # type: ignore[assignment]
+
     def add_known(self, name: str) -> None:
         name = name.strip()
-        if name:
-            with self._lock:
-                self._known.add(name)
+        if not name:
+            return
+        with self._lock:
+            if name in self._known:
+                self._known.move_to_end(name)
+                return
+            self._known[name] = None
+            while len(self._known) > self._known_max:
+                self._known.popitem(last=False)
+            lengths = self._known_lengths.get(name[0], ())
+            if len(name) not in lengths:
+                self._known_lengths[name[0]] = tuple(
+                    sorted((*lengths, len(name)), reverse=True)
+                )
+
+    def _known_spans(self, text: str) -> list[tuple[int, int]]:
+        """Spans of seeded names, found in one left-to-right pass with the
+        longest name first at each position (cost does not grow with the
+        number of known names)."""
+        spans: list[tuple[int, int]] = []
+        with self._lock:
+            known = self._known
+            lengths_by_char = self._known_lengths
+            index = 0
+            size = len(text)
+            while index < size:
+                lengths = lengths_by_char.get(text[index])
+                if lengths and _known_before_ok(text, index):
+                    for length in lengths:
+                        end = index + length
+                        if (
+                            end <= size
+                            and text[index:end] in known
+                            and _known_after_ok(text, end)
+                        ):
+                            spans.append((index, end))
+                            index = end
+                            break
+                    else:
+                        index += 1
+                    continue
+                index += 1
+        return spans
 
     def _allocate(self, category: str, original: str) -> str:
         message = category.encode("utf-8") + b"\x00" + norm(category, original).encode(
@@ -573,7 +708,9 @@ class Pseudonymizer:
                 and isinstance(key, str)
                 and key.lower() == _ASSIGNMENT_TITLE_KEY
             ):
-                return self.pseudonymize(value, heuristic=False)
+                return self.pseudonymize(
+                    value, heuristic=self.assignment_title_heuristic
+                )
             return self.pseudonymize(value)
         if isinstance(value, bool):
             return value
@@ -636,9 +773,24 @@ class Pseudonymizer:
         sentinels[sentinel] = placeholder
         return sentinel
 
-    def pseudonymize(self, text: str, *, heuristic: bool = True) -> str:
+    def pseudonymize(
+        self, text: str, *, heuristic: HeuristicMode | bool = "full"
+    ) -> str:
+        """Mask PII in text.
+
+        heuristic: "full" masks every unseeded Korean-name candidate, "title"
+        only candidates that look like a name token in an activity title (see
+        :func:`_title_candidate`), "off" only seeded known names. True/False
+        are accepted as "full"/"off".
+        """
         if not text:
             return text
+        if heuristic is True:
+            heuristic = "full"
+        elif heuristic is False:
+            heuristic = "off"
+        elif heuristic not in HEURISTIC_MODES:
+            raise ValueError("invalid heuristic mode")
 
         sentinels: dict[str, str] = {}
         protected: dict[str, str] = {}
@@ -652,17 +804,23 @@ class Pseudonymizer:
             return self._replace(sentinels, category, original)
 
         result = PLACEHOLDER_RE.sub(protect, text)
-        for name in sorted(self._known, key=len, reverse=True):
-            result = _known_pattern(name).sub(
-                lambda match: replace(match.group(0), "name"), result
-            )
+        parts: list[str] = []
+        index = 0
+        for start, end in self._known_spans(result):
+            parts.append(result[index:start])
+            parts.append(replace(result[start:end], "name"))
+            index = end
+        parts.append(result[index:])
+        result = "".join(parts)
 
-        if heuristic:
+        if heuristic != "off":
             pieces: list[str] = []
             index = 0
             while index < len(result):
                 match = _heuristic_match_at(result, index)
-                if match is None:
+                if match is None or (
+                    heuristic == "title" and not _title_candidate(result, index, match)
+                ):
                     pieces.append(result[index])
                     index += 1
                     continue
