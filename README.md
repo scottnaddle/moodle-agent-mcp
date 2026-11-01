@@ -89,3 +89,19 @@ flowchart LR
 - 토큰/`.env`는 절대 커밋하지 않기 (`.gitignore`에 포함). admin 토큰·`moodle_mobile_app` 토큰을 MCP에 쓰지 않기.
 - 전용 서비스 사용자 + 제한된 외부 서비스(`restrictedusers=1`) + 가능하면 IP 제한.
 - 실제 학생 데이터에 쓰기 전에 테스트 강좌/스테이징에서 먼저 확인. 자세한 내용은 INSTALL.md 7절.
+
+## 교사별 OAuth (Easy Connect 시험, 스파이크 — 허브 멀티테넌트 모드 전용)
+- claude.ai 커넥터에 `https://<허브>/t/<site>/mcp`만 넣으면 교사가 자기 Moodle 계정으로 로그인·동의하고, 도구는 그 교사의 WS 토큰(플러그인 서비스 `ubionai_user`)으로 실행됩니다. 사이트 관리자와 `moodle_mobile_app` 등 다른 서비스 토큰은 플러그인과 허브 양쪽에서 코드로 거부합니다. 테넌트 정적 Bearer는 그대로 동작합니다.
+- 구현: `src/moodle_mcp/oauth.py`, 테스트 `tests/test_oauth.py`, 실 Moodle E2E `scripts/e2e_moodle_oauth.py`. 배포·환경변수·마이그레이션·롤백: [deploy/hub/SPIKE-OAUTH.md](deploy/hub/SPIKE-OAUTH.md)
+- **허브↔플러그인 back-channel 비밀 프로비저닝** (값은 서버에서 직접 생성, 리포·채팅에 넣지 않음)
+  - 허브: 환경변수 `UBIONAI_HUB_TENANT_SECRETS_DIR`(hub-staging compose: `/run/secrets/tenants` ← 호스트 `/opt/ubionai-hub/secrets/tenants` ro 마운트) 아래 **`<dir>/<site>/oauth.secret`** 파일이 있는 사이트만 OAuth가 켜집니다. 파일은 컨테이너 사용자 `10001` 소유, 권한 `0400`(그룹·기타 비트 금지), 32바이트 이상 한 줄. 조건에 안 맞으면 그 사이트만 OAuth off + 로그
+  - 생성 (출력 없이):
+    ```sh
+    SITE=<site_id>
+    sudo install -d -o root -g 10001 -m 0750 /opt/ubionai-hub/secrets/tenants /opt/ubionai-hub/secrets/tenants/$SITE
+    sudo sh -c "umask 077; openssl rand -base64 48 | tr -d '\n' > /opt/ubionai-hub/secrets/tenants/$SITE/oauth.secret"
+    sudo chown 10001:10001 /opt/ubionai-hub/secrets/tenants/$SITE/oauth.secret && sudo chmod 0400 /opt/ubionai-hub/secrets/tenants/$SITE/oauth.secret
+    ```
+  - Moodle: 같은 값을 플러그인 설정 `local_ubionai/oauth_secret`에, `local_ubionai/hub_site_id`=`<site>`, `local_ubionai/hub_url`=허브 공개 URL
+  - 메시지 형식: `base64url(JSON) "." base64url(HMAC-SHA256(secret, "ubionai-oauth-v1." + body))`, 클레임 `typ`(authz_req/exchange/revoke)·`aud`(Moodle wwwroot)·`site`·`exp`(요청 10분, back-channel 60초)
+- 공개 URL은 `UBIONAI_HUB_PUBLIC_URL`(https 필수)을 기준으로 issuer·메타데이터·`resource`를 만들므로 리버스 프록시 뒤에서도 https로 나갑니다. 허용 redirect_uri: `https://claude.ai/api/mcp/auth_callback`, `https://claude.com/api/mcp/auth_callback`, loopback
