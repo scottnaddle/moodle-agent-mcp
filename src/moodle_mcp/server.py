@@ -35,7 +35,11 @@ from .crypto import (
 )
 from .moodle import MoodleClient, MoodleError
 from .netutil import parse_ip_list
-from .pseudonym import Pseudonymizer, RegistryPseudonymMap
+from .pseudonym import (
+    DEFAULT_ASSIGNMENT_TITLE_HEURISTIC,
+    Pseudonymizer,
+    RegistryPseudonymMap,
+)
 from .registry import DuplicateSite, Registry, TenantError, normalize_moodle_url, ws_endpoint
 
 logger = logging.getLogger(__name__)
@@ -67,7 +71,12 @@ class _PseudonymizerStore:
         self._items: dict[str, tuple[Pseudonymizer, float]] = {}
         self._lock = threading.Lock()
 
-    def get(self, site_id: str, enabled: bool = True) -> Pseudonymizer | None:
+    def get(
+        self,
+        site_id: str,
+        enabled: bool = True,
+        assignment_title_heuristic: str = DEFAULT_ASSIGNMENT_TITLE_HEURISTIC,
+    ) -> Pseudonymizer | None:
         if not enabled:
             return None
         now = time.monotonic()
@@ -78,6 +87,7 @@ class _PseudonymizerStore:
             item = self._items.get(site_id)
             if item is not None:
                 self._items[site_id] = (item[0], now)
+                item[0].assignment_title_heuristic = assignment_title_heuristic
                 return item[0]
             if len(self._items) >= self._max_entries:
                 oldest = min(self._items, key=lambda key: self._items[key][1])
@@ -85,6 +95,7 @@ class _PseudonymizerStore:
             pseudonymizer = Pseudonymizer(
                 derive_key(self._kek, PURPOSE_PSEUDONYM_HMAC, site_id),
                 RegistryPseudonymMap(self._registry, site_id, self._kek),
+                assignment_title_heuristic=assignment_title_heuristic,
             )
             self._items[site_id] = (pseudonymizer, now)
             return pseudonymizer
@@ -124,6 +135,11 @@ WRITE_FUNCTIONS = frozenset(
         "mod_forum_add_discussion",
     }
 )
+# Name seeding for assignment titles: fetch only name fields (no email or id
+# numbers) and seed a few courses at a time. onlyactive stays at Moodle's
+# default (0) so suspended enrolments are seeded too.
+SEED_USER_OPTIONS = [{"name": "userfields", "value": "id,firstname,lastname,fullname"}]
+SEED_CONCURRENCY = 5
 _LOCAL_WRITE_PREFIX = "local_ubionai_"
 _LOCAL_READ_FUNCTIONS = frozenset({
     "local_ubionai_get_course_assignments",
@@ -373,20 +389,30 @@ def create_mcp(client: MoodleClient | None) -> FastMCP:
         courses = result.get("courses") if isinstance(result, dict) else None
         if not isinstance(courses, list):
             return True
-        seeded = True
-        for course in courses:
-            if not isinstance(course, dict) or not course.get("assignments"):
-                continue
-            courseid = course.get("id")
-            if not isinstance(courseid, int):
-                continue
-            try:
-                users = await active.call("core_enrol_get_enrolled_users", courseid=courseid)
-            except MoodleError:
-                seeded = False
-                continue
+        courseids = [
+            course["id"]
+            for course in courses
+            if isinstance(course, dict)
+            and course.get("assignments")
+            and isinstance(course.get("id"), int)
+        ]
+        limit = asyncio.Semaphore(SEED_CONCURRENCY)
+
+        async def seed_one(courseid: int) -> bool:
+            async with limit:
+                try:
+                    users = await active.call(
+                        "core_enrol_get_enrolled_users",
+                        courseid=courseid,
+                        options=SEED_USER_OPTIONS,
+                    )
+                except MoodleError:
+                    return False
             pseudonymizer.seed(_wrap(users, "users"))
-        return seeded
+            return True
+
+        results = await asyncio.gather(*(seed_one(cid) for cid in courseids))
+        return all(results)
 
     async def call(
         wsfunction: str,
@@ -462,10 +488,12 @@ def create_mcp(client: MoodleClient | None) -> FastMCP:
         offset = max(0, int(offset))
         limit = min(100, max(1, int(limit)))
 
+        # Without course_ids, core results are only shown on the first page; later
+        # pages need just their course ids, so skip name seeding for them.
         res = await call(
             "mod_assign_get_assignments",
             courseids=course_ids or None,
-            assignment_listing=True,
+            assignment_listing=bool(course_ids) or offset == 0,
         )
         if not isinstance(res, dict) or "error" in res:
             return res
@@ -1811,7 +1839,9 @@ class TenantRouterMiddleware:
             if verified is None or verified.litellm_ct is None:
                 await _json(send, 403, {"error": "forbidden"})
                 return
-            pseudonymizer = self.pseudonymizers.get(site_id, verified.pseudonymize)
+            pseudonymizer = self.pseudonymizers.get(
+                site_id, verified.pseudonymize, verified.assignment_title_heuristic
+            )
             await _handle_chat_proxy(
                 scope, receive, send, self.registry, verified, pseudonymizer
             )
@@ -1837,7 +1867,9 @@ class TenantRouterMiddleware:
                 await _json(send, 500, {"error": "internal error"})
                 return
             client = MoodleClient(ws_endpoint(tenant.moodle_url), token_buf)
-            pseudonymizer = self.pseudonymizers.get(site_id, tenant.pseudonymize)
+            pseudonymizer = self.pseudonymizers.get(
+                site_id, tenant.pseudonymize, tenant.assignment_title_heuristic
+            )
             state = scope.setdefault("state", {})
             state["moodle_client"] = client
             state["pseudonymizer"] = pseudonymizer

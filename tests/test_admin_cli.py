@@ -78,6 +78,7 @@ def test_add_list_rotate_disable_enable_delete(admin_env, capsys):
             "has_litellm": True,
             "kek_id": load_kek(kek_file).kek_id,
             "pseudonymize": True,
+            "assignment_title_heuristic": "title",
             "created_at": listing[0]["created_at"],
             "updated_at": listing[0]["updated_at"],
         }
@@ -166,6 +167,25 @@ def test_add_and_rotate_pseudonymize_flag(admin_env, capsys):
     assert registry.get("site-a").pseudonymize is True
     assert main(["rotate", "--site-id", "site-a", "--no-pseudonymize"]) == 0
     assert registry.get("site-a").pseudonymize is False
+
+
+def test_rotate_assignment_title_heuristic(admin_env, capsys):
+    tmp_path, db, kek_file = admin_env
+    token = secret_file(tmp_path / "token", b"moodle-token")
+    assert main([
+        "add", "--site-id", "site-a", "--moodle-url", "https://a.test",
+        "--moodle-token-file", str(token), "--bearer-out", str(tmp_path / "bearer"),
+    ]) == 0  # fmt: skip
+    registry = Registry.open(str(db), load_kek(kek_file))
+    assert registry.get("site-a").assignment_title_heuristic == "title"
+    assert main(
+        ["rotate", "--site-id", "site-a", "--assignment-title-heuristic", "full"]
+    ) == 0
+    assert registry.get("site-a").assignment_title_heuristic == "full"
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        main(["rotate", "--site-id", "site-a", "--assignment-title-heuristic", "loose"])
+    assert registry.get("site-a").assignment_title_heuristic == "full"
 
 
 def test_errors_do_not_echo_secrets(admin_env, capsys):

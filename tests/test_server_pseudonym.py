@@ -9,9 +9,9 @@ import pytest
 import respx
 from starlette.testclient import TestClient
 
-from moodle_mcp.crypto import load_kek
+from moodle_mcp.crypto import Kek, load_kek
 from moodle_mcp.registry import Registry
-from moodle_mcp.server import create_app
+from moodle_mcp.server import _PseudonymizerStore, create_app
 
 MCP_HEADERS = {
     "Accept": "application/json, text/event-stream",
@@ -266,3 +266,14 @@ def test_no_originals_in_logs(hub, caplog):
     assert "김민수" not in caplog.text
     assert "20231234" not in caplog.text
     assert "[이름_" not in caplog.text
+
+
+def test_pseudonymizer_store_applies_assignment_title_heuristic(tmp_path):
+    kek = Kek(os.urandom(32))
+    store = _PseudonymizerStore(Registry.open(str(tmp_path / "hub.sqlite3"), kek), kek)
+    first = store.get("site-a")
+    assert first is not None and first.assignment_title_heuristic == "title"
+    again = store.get("site-a", True, "off")
+    assert again is first
+    assert again.assignment_title_heuristic == "off"
+    assert store.get("site-a", False, "full") is None

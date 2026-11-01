@@ -3,6 +3,8 @@ import logging
 import re
 import types
 
+import pytest
+
 from moodle_mcp import pseudonym as pseudonym_module
 from moodle_mcp.pseudonym import PLACEHOLDER_RE, Pseudonymizer
 
@@ -283,3 +285,108 @@ def test_pseudonymize_restore_does_not_log_pii(caplog):
     assert "2023123456" not in caplog.text
     assert "hong@example.com" not in caplog.text
     assert "[이름_" not in caplog.text
+
+
+def test_title_heuristic_masks_name_tokens_only():
+    p = Pseudonymizer()
+    for title in ("김철수 박사 특강 감상문", "[이영희] 보충과제", "박민수_기말보고서", "정민 학생 과제"):
+        assert NAME_RE.search(p.pseudonymize(title, heuristic="title")), title
+    for title in ("조별로 발표", "1주차 보고서", "2주차-발표자료", "우리의 이야기", "보고서의 구조"):
+        assert p.pseudonymize(title, heuristic="title") == title
+
+
+def test_assignment_title_heuristic_setting():
+    payload = {"assignments": [{"id": 9, "name": "김철수 감상문"}]}
+    masked = {
+        mode: Pseudonymizer(assignment_title_heuristic=mode).pseudonymize_value(
+            payload, assignment_titles=True
+        )["assignments"][0]["name"]
+        for mode in ("full", "title", "off")
+    }
+    assert NAME_RE.fullmatch(masked["full"].split(" ")[0])
+    assert NAME_RE.fullmatch(masked["title"].split(" ")[0])
+    assert masked["off"] == "김철수 감상문"
+    assert Pseudonymizer().assignment_title_heuristic == "title"
+
+
+def test_invalid_heuristic_mode_rejected():
+    with pytest.raises(ValueError):
+        Pseudonymizer(assignment_title_heuristic="loose")
+    with pytest.raises(ValueError):
+        Pseudonymizer().pseudonymize("김철수", heuristic="loose")
+
+
+def test_known_names_longest_first_and_boundaries():
+    p = Pseudonymizer(known_names=["김민", "김민수", "Kim"])
+    masked = p.pseudonymize("김민수님, 김민과 Kim, Kimchi", heuristic="off")
+    assert "김민" not in masked
+    assert masked.count("[이름_") == 3
+    assert "Kimchi" in masked
+    assert p.pseudonymize("이김민수", heuristic="off") == "이김민수"
+
+
+def test_known_names_are_capped_lru():
+    p = Pseudonymizer(known_max=2)
+    p.add_known("가나다")
+    p.add_known("라마바")
+    p.add_known("가나다")  # refresh: 라마바 is now the oldest
+    p.add_known("사아자")
+    assert "가나다" not in p.pseudonymize("가나다", heuristic="off")
+    assert p.pseudonymize("라마바", heuristic="off") == "라마바"
+    assert "사아자" not in p.pseudonymize("사아자", heuristic="off")
+
+
+def _random_users(count):
+    import random
+
+    rnd = random.Random(20261101)
+    syllables = [chr(code) for code in range(0xAC00, 0xD7A4)]
+    users = []
+    for index in range(count):
+        first = "".join(rnd.choice(syllables) for _ in range(2))
+        last = rnd.choice(pseudonym_module.SURNAMES)
+        users.append(
+            {"id": index, "firstname": first, "lastname": last, "fullname": last + first}
+        )
+    return users
+
+
+@pytest.mark.slow
+def test_known_name_matching_scales():
+    import time
+
+    p = Pseudonymizer()
+    users = _random_users(5000)
+    p.seed({"users": users})
+    texts = [
+        f"{users[index]['fullname']} 학생의 {index}주차 과제 제출" for index in range(1000)
+    ]
+    started = time.perf_counter()
+    masked = [p.pseudonymize(text) for text in texts]
+    assert time.perf_counter() - started < 2.0
+    assert all(users[index]["fullname"] not in masked[index] for index in range(1000))
+
+
+def test_useridnumber_in_grade_items_is_masked():
+    p = Pseudonymizer()
+    masked = p.pseudonymize_value(
+        {
+            "usergrades": [
+                {"courseid": 3, "userid": 7, "userfullname": "홍길동", "useridnumber": "ST-001"}
+            ]
+        }
+    )
+    grade = masked["usergrades"][0]
+    assert STUDENT_ID_RE.fullmatch(grade["useridnumber"])
+    assert NAME_RE.fullmatch(grade["userfullname"])
+    assert "ST-001" not in json.dumps(masked, ensure_ascii=False)
+
+
+def test_idnumber_regressions():
+    p = Pseudonymizer()
+    course = p.pseudonymize_value({"id": 3, "fullname": "자료구조", "idnumber": "CS-2026"})
+    assert course["fullname"] == "자료구조"
+    users = p.pseudonymize_value(
+        {"users": [{"id": 1, "idnumber": "ST-001", "fullname": "홍길동"}]}
+    )
+    assert STUDENT_ID_RE.fullmatch(users["users"][0]["idnumber"])

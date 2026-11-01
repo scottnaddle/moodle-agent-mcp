@@ -44,6 +44,9 @@ PSEUDONYM_TTL = _parse_pseudonym_ttl()
 _PMAP_AAD_PREFIX = b"ubionai-hub/pmap/v1\x00"
 _PMAP_NONCE_LEN = 12
 
+# Assignment-title name heuristic per tenant (see pseudonym.HEURISTIC_MODES).
+ASSIGNMENT_TITLE_HEURISTICS = ("full", "title", "off")
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
   schema_version INTEGER NOT NULL
@@ -60,6 +63,8 @@ CREATE TABLE IF NOT EXISTS tenants (
                CHECK (status IN ('active','disabled')),
   pseudonymize INTEGER NOT NULL DEFAULT 1
                CHECK (pseudonymize IN (0,1)),
+  assignment_title_heuristic TEXT NOT NULL DEFAULT 'title'
+               CHECK (assignment_title_heuristic IN ('full','title','off')),
   created_at   INTEGER NOT NULL,
   updated_at   INTEGER NOT NULL
 );
@@ -111,6 +116,7 @@ class Tenant:
     created_at: int
     updated_at: int
     pseudonymize: bool = True
+    assignment_title_heuristic: str = "title"
 
 
 def normalize_moodle_url(url: str, allow_http: bool = False) -> str:
@@ -178,6 +184,12 @@ class Registry:
             if "pseudonymize" not in columns:
                 conn.execute(
                     "ALTER TABLE tenants ADD COLUMN pseudonymize INTEGER NOT NULL DEFAULT 1"
+                )
+            if "assignment_title_heuristic" not in columns:
+                conn.execute(
+                    "ALTER TABLE tenants ADD COLUMN assignment_title_heuristic TEXT NOT NULL"
+                    " DEFAULT 'title'"
+                    " CHECK (assignment_title_heuristic IN ('full','title','off'))"
                 )
             row = conn.execute("SELECT schema_version FROM meta").fetchone()
             if row is None:
@@ -251,13 +263,14 @@ class Registry:
             created_at=row[7],
             updated_at=row[8],
             pseudonymize=bool(row[9]),
+            assignment_title_heuristic=row[10],
         )
 
     @staticmethod
     def _select_columns() -> str:
         return (
             "site_id, moodle_url, token_ct, litellm_ct, bearer_hash, kek_id, "
-            "status, created_at, updated_at, pseudonymize"
+            "status, created_at, updated_at, pseudonymize, assignment_title_heuristic"
         )
 
     def add(
@@ -349,6 +362,13 @@ class Registry:
 
     def rotate_pseudonymize(self, site_id: str, enabled: bool) -> None:
         self._update(site_id, "pseudonymize = ?, updated_at = ?", (int(enabled), _now()))
+
+    def set_assignment_title_heuristic(self, site_id: str, mode: str) -> None:
+        if mode not in ASSIGNMENT_TITLE_HEURISTICS:
+            raise TenantError("invalid assignment_title_heuristic")
+        self._update(
+            site_id, "assignment_title_heuristic = ?, updated_at = ?", (mode, _now())
+        )
 
     def _pmap_aad(self, site_id: str, placeholder: str) -> bytes:
         return (
