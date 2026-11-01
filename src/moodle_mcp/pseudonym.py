@@ -528,6 +528,7 @@ class Pseudonymizer:
         name_keys: frozenset[str] = frozenset(),
         user_like: bool = False,
         assignment_titles: bool = False,
+        assignment_title_item: bool = False,
     ) -> object:
         if isinstance(value, dict):
             is_user = user_like or _looks_like_user(value)
@@ -540,17 +541,23 @@ class Pseudonymizer:
                     name_keys,
                     is_user or _is_user_container_key(item_key),
                     assignment_titles,
+                    assignment_title_item,
                 )
             return out
         if isinstance(value, (list, tuple)):
-            in_assignments = isinstance(key, str) and key.lower() == _ASSIGNMENT_LIST_KEY
+            in_assignments = (
+                assignment_titles
+                and isinstance(key, str)
+                and key.lower() == _ASSIGNMENT_LIST_KEY
+            )
             return [
                 self._transform(
                     item,
                     key=None,
                     name_keys=name_keys,
                     user_like=user_like,
-                    assignment_titles=in_assignments,
+                    assignment_titles=assignment_titles,
+                    assignment_title_item=in_assignments,
                 )
                 for item in value
             ]
@@ -562,7 +569,7 @@ class Pseudonymizer:
             elif isinstance(key, str) and key.lower() in _PLAIN_OBJECT_FIELDS:
                 return value
             elif (
-                assignment_titles
+                assignment_title_item
                 and isinstance(key, str)
                 and key.lower() == _ASSIGNMENT_TITLE_KEY
             ):

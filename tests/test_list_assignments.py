@@ -426,6 +426,43 @@ async def test_enrolled_student_name_in_assignment_title_is_masked():
     assert calls[2]["courseid"] == "5"
 
 
+async def test_seeding_failure_masks_student_name_in_assignment_title():
+    page = {
+        "courses": [
+            {
+                "id": 5,
+                "fullname": "Course",
+                "assignments": [{"id": 9, "name": "김민수 보충 과제"}],
+            }
+        ],
+        "total": 1,
+        "offset": 0,
+        "limit": 25,
+        "warnings": [],
+    }
+    seed_error = {
+        "exception": "moodle_exception",
+        "errorcode": "nopermission",
+        "message": "Sorry, but you do not currently have permissions to do that",
+    }
+    token = _current_pseudonymizer.set(Pseudonymizer())
+    try:
+        result, calls = await call_list_assignments(
+            {
+                "mod_assign_get_assignments": {"courses": [], "warnings": []},
+                "local_ubionai_list_course_assignments": page,
+                "core_enrol_get_enrolled_users": seed_error,
+            }
+        )
+    finally:
+        _current_pseudonymizer.reset(token)
+    rendered = json.dumps(result, ensure_ascii=False)
+    assert "김민수" not in rendered
+    assert PLACEHOLDER_RE.search(result["courses"][0]["assignments"][0]["name"])
+    assert calls[-1]["wsfunction"] == "core_enrol_get_enrolled_users"
+    assert calls[-1]["courseid"] == "5"
+
+
 async def test_ordinary_assignment_title_stays_readable():
     page = {
         "courses": [

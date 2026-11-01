@@ -364,10 +364,16 @@ def create_mcp(client: MoodleClient | None) -> FastMCP:
 
     async def _seed_course_users(
         active: MoodleClient, pseudonymizer: Pseudonymizer, result: Any
-    ) -> None:
+    ) -> bool:
+        """Seed enrolled-user names for every course in the result.
+
+        Returns False when any seeding call fails, so the caller can fail closed:
+        with incomplete seeding, assignment titles must keep the heuristic on.
+        """
         courses = result.get("courses") if isinstance(result, dict) else None
         if not isinstance(courses, list):
-            return
+            return True
+        seeded = True
         for course in courses:
             if not isinstance(course, dict) or not course.get("assignments"):
                 continue
@@ -377,8 +383,10 @@ def create_mcp(client: MoodleClient | None) -> FastMCP:
             try:
                 users = await active.call("core_enrol_get_enrolled_users", courseid=courseid)
             except MoodleError:
+                seeded = False
                 continue
             pseudonymizer.seed(_wrap(users, "users"))
+        return seeded
 
     async def call(
         wsfunction: str,
@@ -405,10 +413,15 @@ def create_mcp(client: MoodleClient | None) -> FastMCP:
         except MoodleError as exc:
             result = {"error": str(exc)}
         if pseudonymizer is not None:
+            # Seeded names are the only masking for assignment titles, so fail
+            # closed (heuristic on) if seeding any course failed.
+            assignment_titles = assignment_listing
             if assignment_listing:
-                await _seed_course_users(active, pseudonymizer, result)
+                assignment_titles = await _seed_course_users(
+                    active, pseudonymizer, result
+                )
             result = pseudonymizer.pseudonymize_value(
-                result, assignment_titles=assignment_listing
+                result, assignment_titles=assignment_titles
             )
         return result
 
