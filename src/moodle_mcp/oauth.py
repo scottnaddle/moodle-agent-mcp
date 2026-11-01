@@ -26,12 +26,14 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import html
 import ipaddress
 import json
 import logging
 import os
 import re
 import secrets
+import socket
 import stat
 import time
 from dataclasses import dataclass, field
@@ -56,7 +58,6 @@ ALLOWED_REDIRECTS = (
     "https://claude.ai/api/mcp/auth_callback",
     "https://claude.com/api/mcp/auth_callback",
 )
-TRUSTED_CIMD = ("https://claude.ai/oauth/claude-code-client-metadata",)
 SECRET_FILE = "oauth.secret"
 MIN_SECRET_LEN = 32
 CODE_TTL = 60
@@ -297,15 +298,210 @@ class Grant:
     valid_until: int
 
 
-CimdFetcher = Callable[[str], Awaitable[dict[str, Any]]]
+class CimdError(Exception):
+    """A Client ID Metadata Document could not be fetched or is unusable (reason is log-safe)."""
 
 
-async def default_cimd_fetcher(url: str) -> dict[str, Any]:
-    async with httpx.AsyncClient(timeout=5, follow_redirects=False) as client:
-        resp = await client.get(url, headers={"Accept": "application/json"})
-    if resp.status_code != 200 or len(resp.content) > 5 * 1024:
-        raise ValueError(f"CIMD fetch failed: HTTP {resp.status_code}")
-    return resp.json()
+Resolver = Callable[[str, int], Awaitable[list[str]]]
+_NAT64 = ipaddress.ip_network("64:ff9b::/96")
+
+
+def cimd_url_ok(client_id: str) -> bool:
+    """CIMD client_id: https URL with a host and a real path; no userinfo, fragment or dot segments."""
+    try:
+        parts = urlsplit(client_id)
+        parts.port  # noqa: B018 - raises ValueError on a bad port
+    except ValueError:
+        return False
+    if parts.scheme != "https" or not parts.hostname or parts.username is not None or parts.password is not None:
+        return False
+    if "#" in client_id or "\\" in client_id or any(ord(c) <= 0x20 or ord(c) == 0x7F for c in client_id):
+        return False
+    segments = parts.path.split("/")
+    return len(parts.path) > 1 and not any(seg in (".", "..") for seg in segments)
+
+
+def ip_allowed(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Only globally routable unicast addresses (IPv4-mapped / 6to4 / NAT64 checked as their IPv4)."""
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped is not None:
+            return ip_allowed(ip.ipv4_mapped)
+        if ip.sixtofour is not None:
+            return ip_allowed(ip.sixtofour)
+        if ip.teredo is not None:
+            return False
+        if ip in _NAT64:
+            return ip_allowed(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF))
+    return ip.is_global and not (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
+async def _system_resolve(host: str, port: int) -> list[str]:
+    infos = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    return [str(info[4][0]).split("%", 1)[0] for info in infos]
+
+
+def _max_age(cache_control: str) -> int | None:
+    directives = [d.strip().lower() for d in cache_control.split(",")]
+    if "no-store" in directives or "no-cache" in directives:
+        return 0
+    for d in directives:
+        if d.startswith("max-age="):
+            try:
+                return int(d[8:].strip('"'))
+            except ValueError:
+                return None
+    return None
+
+
+@dataclass
+class CimdFetcher:
+    """Fetches Client ID Metadata Documents (MCP 2025-11-25) with SSRF protection and a TTL cache.
+
+    The host is resolved here, every address must be public, and the TCP connection goes to the
+    vetted address (TLS SNI and certificate checks still use the host name), so DNS rebinding
+    between check and connect cannot reach an internal address. Redirects are followed manually,
+    https only, and re-vetted. Proxies from the environment are ignored for the same reason.
+    """
+
+    transport: httpx.AsyncBaseTransport | None = None
+    resolve: Resolver = _system_resolve
+    timeout: float = 5.0
+    max_bytes: int = 64 * 1024
+    max_redirects: int = 3
+    default_ttl: int = 600
+    min_ttl: int = 60
+    max_ttl: int = 3600
+    negative_ttl: int = 30
+    clock: Callable[[], float] = time.monotonic
+    cache: dict[str, tuple[float, dict[str, Any] | None]] = field(default_factory=dict)
+
+    async def __call__(self, url: str) -> dict[str, Any]:
+        now = self.clock()
+        hit = self.cache.get(url)
+        if hit is not None and hit[0] > now:
+            if hit[1] is None:
+                raise CimdError("cached failure")
+            return hit[1]
+        try:
+            async with asyncio.timeout(self.timeout):
+                doc, ttl = await self._fetch(url)
+        except (CimdError, TimeoutError, httpx.HTTPError, OSError, ValueError) as exc:
+            self._store(url, None, self.negative_ttl)
+            if isinstance(exc, CimdError):
+                raise
+            raise CimdError("timeout" if isinstance(exc, TimeoutError) else type(exc).__name__) from exc
+        self._store(url, doc, ttl)
+        return doc
+
+    def _store(self, url: str, doc: dict[str, Any] | None, ttl: int) -> None:
+        now = self.clock()
+        if len(self.cache) > 1000:
+            for key in [k for k, (exp, _) in self.cache.items() if exp <= now]:
+                del self.cache[key]
+            if len(self.cache) > 1000:
+                self.cache.clear()
+        self.cache[url] = (now + ttl, doc)
+
+    async def _vetted_ip(self, host: str, port: int) -> str:
+        try:
+            literal = ipaddress.ip_address(host.strip("[]"))
+        except ValueError:
+            literal = None
+        addresses = [str(literal)] if literal is not None else await self.resolve(host, port)
+        if not addresses:
+            raise CimdError("host did not resolve")
+        ips = [ipaddress.ip_address(a) for a in addresses]
+        if not all(ip_allowed(ip) for ip in ips):
+            raise CimdError("host resolves to a non-public address")
+        return str(ips[0])
+
+    async def _fetch(self, url: str) -> tuple[dict[str, Any], int]:
+        async with httpx.AsyncClient(
+            transport=self.transport, timeout=self.timeout, follow_redirects=False, trust_env=False
+        ) as client:
+            target = url
+            for _ in range(self.max_redirects + 1):
+                parts = urlsplit(target)
+                if parts.scheme != "https" or not parts.hostname or parts.username or parts.password:
+                    raise CimdError("non-https or malformed URL")
+                host, port = parts.hostname, parts.port or 443
+                ip = await self._vetted_ip(host, port)
+                ip_host = f"[{ip}]" if ":" in ip else ip
+                netloc = ip_host if port == 443 else f"{ip_host}:{port}"
+                pinned = parts._replace(netloc=netloc, fragment="").geturl()
+                host_header = host if port == 443 else f"{host}:{port}"
+                if ":" in host:
+                    host_header = f"[{host}]" if port == 443 else f"[{host}]:{port}"
+                request = client.build_request(
+                    "GET",
+                    pinned,
+                    headers={"Host": host_header, "Accept": "application/json"},
+                    extensions={"sni_hostname": host},
+                )
+                resp = await client.send(request, stream=True)
+                try:
+                    if resp.status_code in (301, 302, 303, 307, 308):
+                        location = resp.headers.get("location", "")
+                        target = str(httpx.URL(target).join(location))
+                        continue
+                    if resp.status_code != 200:
+                        raise CimdError(f"HTTP {resp.status_code}")
+                    declared = resp.headers.get("content-length")
+                    if declared and declared.isdigit() and int(declared) > self.max_bytes:
+                        raise CimdError("document too large")
+                    body = bytearray()
+                    async for chunk in resp.aiter_bytes():
+                        body += chunk
+                        if len(body) > self.max_bytes:
+                            raise CimdError("document too large")
+                    max_age = _max_age(resp.headers.get("cache-control", ""))
+                finally:
+                    await resp.aclose()
+                try:
+                    doc = json.loads(bytes(body))
+                except (ValueError, UnicodeDecodeError) as exc:
+                    raise CimdError("document is not JSON") from exc
+                if not isinstance(doc, dict):
+                    raise CimdError("document is not a JSON object")
+                ttl = self.default_ttl if max_age is None else max(self.min_ttl, min(self.max_ttl, max_age))
+                return doc, ttl
+            raise CimdError("too many redirects")
+
+
+CLIENT_SECRET_METHODS = frozenset({"client_secret_basic", "client_secret_post", "client_secret_jwt"})
+
+
+def cimd_problem(client_id: str, doc: dict[str, Any]) -> str | None:
+    """Why a fetched CIMD may not be used for ``client_id`` (None when it is acceptable)."""
+    if doc.get("client_id") != client_id:
+        return "client_id in document does not match the URL"
+    uris = doc.get("redirect_uris")
+    if not isinstance(uris, list) or not uris or not all(isinstance(u, str) for u in uris):
+        return "redirect_uris missing"
+    method = doc.get("token_endpoint_auth_method", "none")
+    if method in CLIENT_SECRET_METHODS or "client_secret" in doc:
+        return "client secrets are not allowed in a metadata document"
+    if method != "none":
+        return f"unsupported token_endpoint_auth_method {method!r}"
+    grants = doc.get("grant_types", ["authorization_code"])
+    if not isinstance(grants, list) or "authorization_code" not in grants:
+        return "authorization_code grant not listed"
+    return None
+
+
+def _display_name(value: Any) -> str | None:
+    """Client-supplied name for the consent page: printable, single line, bounded (escaped by Moodle s())."""
+    if not isinstance(value, str):
+        return None
+    cleaned = "".join(c for c in value if c.isprintable()).strip()
+    return cleaned[:100] or None
 
 
 def _oauth_error(error: str, description: str, status: int = 400) -> JSONResponse:
@@ -318,7 +514,7 @@ def _oauth_error(error: str, description: str, status: int = 400) -> JSONRespons
 
 def _page(message: str, status: int) -> HTMLResponse:
     return HTMLResponse(
-        f"<!doctype html><title>UBION AI</title><p>{message}</p>",
+        f"<!doctype html><title>UBION AI</title><p>{html.escape(message)}</p>",
         status_code=status,
         headers={"Cache-Control": "no-store"},
     )
@@ -333,8 +529,7 @@ class OAuthServer:
     public_url: str
     secrets_dir: str
     transport: httpx.AsyncBaseTransport | None = None
-    cimd_fetcher: CimdFetcher = default_cimd_fetcher
-    trusted_cimd: tuple[str, ...] = TRUSTED_CIMD
+    cimd_fetcher: CimdFetcher = field(default_factory=CimdFetcher)
     access_ttl: int = ACCESS_TTL
     refresh_ttl: int = REFRESH_TTL
     requests: dict[str, AuthRequest] = field(default_factory=dict)
@@ -533,23 +728,23 @@ class OAuthServer:
     async def _client(self, site: str, client_id: str) -> Client | None:
         if not client_id:
             return None
-        if not client_id.startswith("https://"):
-            return self._load_client(site, client_id)
-        if client_id not in self.trusted_cimd:
-            logger.warning("CIMD client not on trusted list site=%s", site)
+        if "://" not in client_id:
+            client = self._load_client(site, client_id)
+            return client if client is not None and client.source == "dcr" else None
+        if not cimd_url_ok(client_id):
+            logger.warning("CIMD client_id rejected (not an https URL with a path) site=%s", site)
             return None
         try:
             doc = await self.cimd_fetcher(client_id)
-        except Exception as exc:  # noqa: BLE001 - any fetch/parse failure rejects the client
-            logger.warning("CIMD fetch failed: %s", type(exc).__name__)
+        except CimdError as exc:
+            logger.warning("CIMD fetch failed site=%s host=%s: %s", site, urlsplit(client_id).hostname, exc)
             return None
-        uris = doc.get("redirect_uris")
-        if doc.get("client_id") != client_id or not isinstance(uris, list) or not uris:
+        problem = cimd_problem(client_id, doc)
+        if problem:
+            logger.warning("CIMD document rejected site=%s host=%s: %s", site, urlsplit(client_id).hostname, problem)
             return None
-        if doc.get("token_endpoint_auth_method", "none") != "none":
-            return None
-        name = doc.get("client_name")
-        client = Client(client_id, [u for u in uris if isinstance(u, str)], name if isinstance(name, str) else None, "cimd")
+        uris = [u for u in doc["redirect_uris"] if isinstance(u, str)]
+        client = Client(client_id, uris, _display_name(doc.get("client_name")), "cimd")
         self._save_client(site, client)
         return client
 
@@ -605,7 +800,7 @@ class OAuthServer:
         req = AuthRequest(
             site=site,
             client_id=client.client_id,
-            client_name=client.client_name or urlsplit(redirect_uri).hostname or "client",
+            client_name=self._consent_name(client, redirect_uri),
             redirect_uri=redirect_uri,
             client_state=client_state,
             code_challenge=challenge,
@@ -624,6 +819,7 @@ class OAuthServer:
                 "site": site,
                 "state": state,
                 "client_name": req.client_name,
+                "client_host": urlsplit(client.client_id).hostname if client.source == "cimd" else None,
                 "redirect_host": urlsplit(redirect_uri).hostname,
                 "scope": req.scope,
                 "callback": f"{self.issuer(site)}/oauth/callback",
@@ -643,6 +839,18 @@ class OAuthServer:
             samesite="lax",
         )
         return response
+
+    @staticmethod
+    def _consent_name(client: Client, redirect_uri: str) -> str:
+        """Name shown on the Moodle consent page (escaped there with s()).
+
+        A CIMD name is self-asserted by whoever hosts the document, so the document's host is
+        part of the label: "Claude (claude.ai)" cannot be impersonated from another domain.
+        """
+        if client.source == "cimd":
+            host = urlsplit(client.client_id).hostname or "unknown"
+            return f"{client.client_name or host} — {host}" if client.client_name else host
+        return client.client_name or urlsplit(redirect_uri).hostname or "client"
 
     def _to_client(self, redirect_uri: str, site: str, state: str | None, **params: str) -> Response:
         params = {**params, "iss": self.issuer(site)}

@@ -578,19 +578,290 @@ def test_redirect_uri_allowlist(hub):
     assert _authorize(client, ok.json()["client_id"], challenge, redirect="https://evil.example/cb").status_code == 400
 
 
-def test_cimd_trusted_only(hub, monkeypatch):
+# --- Client ID Metadata Documents (MCP 2025-11-25) -----------------------------------------
+
+CLAUDE_CIMD = "https://claude.ai/oauth/mcp-oauth-client-metadata"
+CLAUDE_CALLBACK = "https://claude.ai/api/mcp/auth_callback"
+PUBLIC_IP = "160.79.104.10"
+
+
+def _claude_doc(**over):
+    doc = {
+        "client_id": CLAUDE_CIMD,
+        "client_name": "Claude",
+        "redirect_uris": [CLAUDE_CALLBACK],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+    }
+    doc.update(over)
+    return doc
+
+
+class FakeWeb:
+    """DNS + HTTPS for CIMD hosts, as a resolver and an httpx transport (no network)."""
+
+    def __init__(self):
+        self.dns = {"claude.ai": [PUBLIC_IP]}
+        self.docs = {CLAUDE_CIMD: (200, _claude_doc(), {})}
+        self.requests: list[httpx.Request] = []
+        self.delay = 0.0
+
+    async def resolve(self, host, port):
+        if host not in self.dns:
+            raise OSError("NXDOMAIN")
+        return self.dns[host]
+
+    async def handler(self, request):
+        self.requests.append(request)
+        if self.delay:
+            import asyncio
+
+            await asyncio.sleep(self.delay)
+        url = f"https://{request.headers['host']}{request.url.raw_path.decode()}"
+        status, body, headers = self.docs.get(url, (404, {"error": "nope"}, {}))
+        if isinstance(body, bytes):
+            return httpx.Response(status, content=body, headers=headers)
+        return httpx.Response(status, json=body, headers=headers)
+
+    def fetcher(self, **kw):
+        return oauth_mod.CimdFetcher(transport=httpx.MockTransport(self.handler), resolve=self.resolve, **kw)
+
+
+@pytest.fixture
+def web(hub):
+    fake = FakeWeb()
+    hub[0].app.oauth.cimd_fetcher = fake.fetcher()
+    return fake
+
+
+def _cimd_authorize(client, client_id=CLAUDE_CIMD, redirect=CLAUDE_CALLBACK, challenge=None):
+    return _authorize(client, client_id, challenge or _pkce()[1], redirect=redirect)
+
+
+def test_cimd_claude_ai_happy_path_and_token(hub, web):
     client, moodle, _ = hub
-    assert _authorize(client, "https://attacker.example/meta.json", _pkce()[1]).status_code == 400
-    trusted = oauth_mod.TRUSTED_CIMD[0]
-    app_oauth = client.app.oauth
-
-    async def fetch(url):
-        assert url == trusted
-        return {"client_id": trusted, "client_name": "Claude Code", "redirect_uris": ["http://localhost/callback"]}
-
-    monkeypatch.setattr(app_oauth, "cimd_fetcher", fetch)
-    resp = _authorize(client, trusted, _pkce()[1], redirect="http://localhost:4567/callback")
+    verifier, challenge = _pkce()
+    resp = _cimd_authorize(client, challenge=challenge)
     assert resp.status_code == 302 and resp.headers["location"].startswith(MOODLE)
+    # pinned to the vetted IP; Host/SNI keep the real name
+    sent = web.requests[0]
+    assert sent.url.host == PUBLIC_IP and sent.headers["host"] == "claude.ai"
+    assert sent.extensions["sni_hostname"] == "claude.ai"
+    req = parse_qs(urlsplit(resp.headers["location"]).query)["req"][0]
+    claims = verify_message(SECRET, req, "authz_req")
+    assert claims["client_name"] == "Claude — claude.ai"
+    assert claims["client_host"] == "claude.ai" and claims["redirect_host"] == "claude.ai"
+    back = client.get(moodle.approve(resp.headers["location"], 3))
+    q = _q(back)
+    assert back.headers["location"].startswith(CLAUDE_CALLBACK) and "code" in q
+    tok = client.post(f"/t/{SITE}/oauth/token", data={
+        "grant_type": "authorization_code", "code": q["code"], "client_id": CLAUDE_CIMD,
+        "redirect_uri": CLAUDE_CALLBACK, "code_verifier": verifier,
+    })
+    assert tok.status_code == 200, tok.text
+    t = tok.json()
+    assert _mcp(client, t["access_token"]).status_code == 200
+    again = client.post(f"/t/{SITE}/oauth/token", data={
+        "grant_type": "refresh_token", "refresh_token": t["refresh_token"], "client_id": CLAUDE_CIMD,
+    })
+    assert again.status_code == 200
+    # PKCE is still required for URL clients
+    assert _q(_authorize(client, CLAUDE_CIMD, None, redirect=CLAUDE_CALLBACK))["error"] == "invalid_request"
+
+
+def test_cimd_client_name_is_sanitized(hub, web):
+    client, _, _ = hub
+    web.docs[CLAUDE_CIMD] = (200, _claude_doc(client_name="<b>Claude</b>\n\x00" + "x" * 300), {})
+    resp = _cimd_authorize(client)
+    claims = verify_message(SECRET, parse_qs(urlsplit(resp.headers["location"]).query)["req"][0], "authz_req")
+    name, host = claims["client_name"].rsplit(" — ", 1)
+    assert host == "claude.ai" and "\n" not in name and "\x00" not in name and len(name) <= 100
+
+
+@pytest.mark.parametrize("doc", [
+    _claude_doc(client_id="https://claude.ai/oauth/other"),
+    _claude_doc(client_id=CLAUDE_CIMD + "/"),
+    _claude_doc(redirect_uris=["https://claude.com/api/mcp/auth_callback"]),
+    _claude_doc(redirect_uris=[]),
+    _claude_doc(token_endpoint_auth_method="client_secret_basic"),
+    _claude_doc(token_endpoint_auth_method="client_secret_post"),
+    _claude_doc(token_endpoint_auth_method="private_key_jwt"),
+    _claude_doc(client_secret="s3cr3t"),
+])
+def test_cimd_document_rejected(hub, web, doc):
+    client, _, _ = hub
+    web.docs[CLAUDE_CIMD] = (200, doc, {})
+    resp = _cimd_authorize(client)
+    assert resp.status_code == 400 and "invalid" in resp.text
+
+
+def test_cimd_auth_method_absent_is_public(hub, web):
+    client, _, _ = hub
+    doc = _claude_doc()
+    del doc["token_endpoint_auth_method"], doc["grant_types"]
+    web.docs[CLAUDE_CIMD] = (200, doc, {})
+    assert _cimd_authorize(client).status_code == 302
+
+
+def test_cimd_redirect_not_listed(hub, web):
+    client, _, _ = hub
+    resp = _cimd_authorize(client, redirect="https://claude.com/api/mcp/auth_callback")
+    assert resp.status_code == 400 and "invalid redirect_uri" in resp.text
+
+
+@pytest.mark.parametrize("client_id", [
+    "http://claude.ai/oauth/mcp-oauth-client-metadata",
+    "https://claude.ai",
+    "https://claude.ai/",
+    "https://user:pw@claude.ai/oauth/meta",
+    "https://claude.ai/oauth/meta#frag",
+    "https://claude.ai/oauth/../meta",
+    "ftp://claude.ai/oauth/meta",
+])
+def test_cimd_client_id_url_shape(hub, web, client_id):
+    client, _, _ = hub
+    assert _cimd_authorize(client, client_id=client_id).status_code == 400
+    assert web.requests == []
+
+
+@pytest.mark.parametrize("ips", [
+    ["127.0.0.1"], ["10.0.0.5"], ["192.168.1.1"], ["172.16.0.1"], ["169.254.169.254"], ["100.64.0.1"],
+    ["0.0.0.0"], ["224.0.0.1"], ["240.0.0.1"], ["::1"], ["fe80::1"], ["fc00::1"], ["ff02::1"],
+    ["::ffff:127.0.0.1"], ["::ffff:169.254.169.254"], ["64:ff9b::a00:1"], ["2002:7f00:1::1"],
+    [PUBLIC_IP, "10.0.0.1"],  # any private answer poisons the lookup
+])
+def test_cimd_private_ip_blocked(hub, web, ips):
+    client, _, _ = hub
+    web.dns["claude.ai"] = ips
+    assert _cimd_authorize(client).status_code == 400
+    assert web.requests == []
+
+
+async def test_cimd_ip_literal_blocked():
+    web = FakeWeb()
+    fetch = web.fetcher()
+    for url in ("https://127.0.0.1/meta", "https://[::1]/meta", "https://[::ffff:10.0.0.1]/meta"):
+        with pytest.raises(oauth_mod.CimdError, match="non-public"):
+            await fetch(url)
+    assert web.requests == []
+
+
+async def test_cimd_oversized_document():
+    web = FakeWeb()
+    web.docs[CLAUDE_CIMD] = (200, _claude_doc(pad="x" * 70_000), {})
+    with pytest.raises(oauth_mod.CimdError, match="too large"):
+        await web.fetcher()(CLAUDE_CIMD)
+    # also without a Content-Length header (streamed)
+    web2 = FakeWeb()
+    big = json.dumps(_claude_doc(pad="x" * 70_000)).encode()
+
+    async def chunks():
+        for i in range(0, len(big), 4096):
+            yield big[i:i + 4096]
+
+    async def handler(request):
+        return httpx.Response(200, content=chunks())
+
+    fetch = oauth_mod.CimdFetcher(transport=httpx.MockTransport(handler), resolve=web2.resolve)
+    with pytest.raises(oauth_mod.CimdError, match="too large"):
+        await fetch(CLAUDE_CIMD)
+
+
+async def test_cimd_timeout():
+    web = FakeWeb()
+    web.delay = 1.0
+    with pytest.raises(oauth_mod.CimdError, match="timeout"):
+        await web.fetcher(timeout=0.1)(CLAUDE_CIMD)
+
+
+async def test_cimd_redirects_https_only_and_revetted():
+    web = FakeWeb()
+    web.dns["meta.example"] = [PUBLIC_IP]
+    web.dns["internal.example"] = ["10.1.2.3"]
+    web.docs[CLAUDE_CIMD] = (302, b"", {"location": "http://claude.ai/plain"})
+    with pytest.raises(oauth_mod.CimdError, match="non-https"):
+        await web.fetcher()(CLAUDE_CIMD)
+    web = FakeWeb()
+    web.dns["internal.example"] = ["10.1.2.3"]
+    web.docs[CLAUDE_CIMD] = (302, b"", {"location": "https://internal.example/x"})
+    with pytest.raises(oauth_mod.CimdError, match="non-public"):
+        await web.fetcher()(CLAUDE_CIMD)
+    web = FakeWeb()
+    web.dns["meta.example"] = [PUBLIC_IP]
+    web.docs[CLAUDE_CIMD] = (301, b"", {"location": "https://meta.example/doc"})
+    web.docs["https://meta.example/doc"] = (200, _claude_doc(), {})
+    assert (await web.fetcher()(CLAUDE_CIMD))["client_id"] == CLAUDE_CIMD
+
+
+async def test_cimd_non_json_and_http_errors():
+    web = FakeWeb()
+    web.docs[CLAUDE_CIMD] = (200, b"<html>", {})
+    with pytest.raises(oauth_mod.CimdError, match="not JSON"):
+        await web.fetcher()(CLAUDE_CIMD)
+    web.docs[CLAUDE_CIMD] = (200, b"[1]", {})
+    with pytest.raises(oauth_mod.CimdError):
+        await web.fetcher()(CLAUDE_CIMD)
+    web.docs[CLAUDE_CIMD] = (500, {}, {})
+    with pytest.raises(oauth_mod.CimdError, match="HTTP 500"):
+        await web.fetcher()(CLAUDE_CIMD)
+
+
+async def test_cimd_cache_hit_ttl_and_negative_cache():
+    web = FakeWeb()
+    now = [1000.0]
+    fetch = web.fetcher(clock=lambda: now[0])
+    web.docs[CLAUDE_CIMD] = (200, _claude_doc(), {"cache-control": "public, max-age=120"})
+    await fetch(CLAUDE_CIMD)
+    await fetch(CLAUDE_CIMD)
+    assert len(web.requests) == 1  # cache hit
+    now[0] += 121
+    await fetch(CLAUDE_CIMD)
+    assert len(web.requests) == 2  # max-age honoured
+    # bounds: huge max-age is capped, no-store still caches for the minimum
+    web.docs[CLAUDE_CIMD] = (200, _claude_doc(), {"cache-control": "max-age=99999999"})
+    now[0] += 1000
+    await fetch(CLAUDE_CIMD)
+    assert fetch.cache[CLAUDE_CIMD][0] == now[0] + fetch.max_ttl
+    web.docs[CLAUDE_CIMD] = (200, _claude_doc(), {"cache-control": "no-store"})
+    now[0] += fetch.max_ttl + 1
+    await fetch(CLAUDE_CIMD)
+    assert fetch.cache[CLAUDE_CIMD][0] == now[0] + fetch.min_ttl
+    web.docs[CLAUDE_CIMD] = (200, _claude_doc(), {})
+    now[0] += fetch.min_ttl + 1
+    await fetch(CLAUDE_CIMD)
+    assert fetch.cache[CLAUDE_CIMD][0] == now[0] + fetch.default_ttl
+    # negative caching: a failure is remembered briefly, then retried
+    other = "https://claude.ai/oauth/missing"
+    count = len(web.requests)
+    for _ in range(3):
+        with pytest.raises(oauth_mod.CimdError):
+            await fetch(other)
+    assert len(web.requests) == count + 1
+    now[0] += fetch.negative_ttl + 1
+    with pytest.raises(oauth_mod.CimdError):
+        await fetch(other)
+    assert len(web.requests) == count + 2
+
+
+def test_cimd_cache_used_across_authorize_calls(hub, web):
+    client, _, _ = hub
+    assert _cimd_authorize(client).status_code == 302
+    assert _cimd_authorize(client).status_code == 302
+    assert len(web.requests) == 1
+
+
+def test_cimd_metadata_flag_and_dcr_still_works(hub, web):
+    client, moodle, _ = hub
+    meta = client.get(f"/.well-known/oauth-authorization-server/t/{SITE}").json()
+    assert meta["client_id_metadata_document_supported"] is True
+    assert meta["registration_endpoint"] == f"https://hub.test/t/{SITE}/oauth/register"
+    assert meta["token_endpoint_auth_methods_supported"] == ["none"]
+    client_id, t = _tokens(client, moodle)
+    assert client_id.startswith("dcr_") and _mcp(client, t["access_token"]).status_code == 200
+    assert web.requests == []  # DCR clients never trigger a fetch
+    # a URL client_id cannot borrow a DCR row and vice versa
+    assert _authorize(client, "dcr_unknown", _pkce()[1]).status_code == 400
 
 
 def test_signing_roundtrip_rejects_tampering():
