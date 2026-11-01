@@ -60,11 +60,18 @@ _USER_CONTAINER_KEYS = frozenset(
     {"users", "participants", "members", "students", "author", "user"}
 )
 _USER_MARKER_KEYS = frozenset(
-    {"firstname", "lastname", "email", "emailaddress", "username", "idnumber", "userid"}
+    {"firstname", "lastname", "email", "emailaddress", "username", "userid"}
 )
 # Names of non-user objects (courses, categories, activities) are kept as-is,
 # including from heuristic name detection, unless the object is user-like.
 _PLAIN_OBJECT_FIELDS = frozenset({"fullname", "shortname"})
+# Assignment titles (only inside "assignments" lists of list_assignments
+# results): heuristic Korean-name detection causes false positives on activity
+# titles, so it is skipped for the assignment "name". Known names seeded from
+# the courses' enrolled users are still masked there. Every other title field
+# keeps the heuristic.
+_ASSIGNMENT_LIST_KEY = "assignments"
+_ASSIGNMENT_TITLE_KEY = "name"
 
 
 def _looks_like_user(value: object) -> bool:
@@ -520,6 +527,8 @@ class Pseudonymizer:
         key: str | None = None,
         name_keys: frozenset[str] = frozenset(),
         user_like: bool = False,
+        assignment_titles: bool = False,
+        assignment_title_item: bool = False,
     ) -> object:
         if isinstance(value, dict):
             is_user = user_like or _looks_like_user(value)
@@ -531,11 +540,25 @@ class Pseudonymizer:
                     item_key,
                     name_keys,
                     is_user or _is_user_container_key(item_key),
+                    assignment_titles,
+                    assignment_title_item,
                 )
             return out
         if isinstance(value, (list, tuple)):
+            in_assignments = (
+                assignment_titles
+                and isinstance(key, str)
+                and key.lower() == _ASSIGNMENT_LIST_KEY
+            )
             return [
-                self._transform(item, key=None, name_keys=name_keys, user_like=user_like)
+                self._transform(
+                    item,
+                    key=None,
+                    name_keys=name_keys,
+                    user_like=user_like,
+                    assignment_titles=assignment_titles,
+                    assignment_title_item=in_assignments,
+                )
                 for item in value
             ]
         if isinstance(value, str):
@@ -545,6 +568,12 @@ class Pseudonymizer:
                     return self._allocate(category, value)
             elif isinstance(key, str) and key.lower() in _PLAIN_OBJECT_FIELDS:
                 return value
+            elif (
+                assignment_title_item
+                and isinstance(key, str)
+                and key.lower() == _ASSIGNMENT_TITLE_KEY
+            ):
+                return self.pseudonymize(value, heuristic=False)
             return self.pseudonymize(value)
         if isinstance(value, bool):
             return value
@@ -554,9 +583,20 @@ class Pseudonymizer:
                 return self._allocate(category, str(value))
         return value
 
-    def pseudonymize_value(self, value: object, *, name_keys: frozenset[str] = frozenset()) -> object:
+    def pseudonymize_value(
+        self,
+        value: object,
+        *,
+        name_keys: frozenset[str] = frozenset(),
+        assignment_titles: bool = False,
+    ) -> object:
         self._seed_from(value, name_keys)
-        return self._transform(value, name_keys=name_keys)
+        return self._transform(
+            value, name_keys=name_keys, assignment_titles=assignment_titles
+        )
+
+    def seed(self, value: object) -> None:
+        self._seed_from(value)
 
     def pseudonymize_chat_payload(self, payload: object) -> object:
         self._seed_from(payload)
@@ -596,7 +636,7 @@ class Pseudonymizer:
         sentinels[sentinel] = placeholder
         return sentinel
 
-    def pseudonymize(self, text: str) -> str:
+    def pseudonymize(self, text: str, *, heuristic: bool = True) -> str:
         if not text:
             return text
 
@@ -617,18 +657,19 @@ class Pseudonymizer:
                 lambda match: replace(match.group(0), "name"), result
             )
 
-        pieces: list[str] = []
-        index = 0
-        while index < len(result):
-            match = _heuristic_match_at(result, index)
-            if match is None:
-                pieces.append(result[index])
-                index += 1
-                continue
-            _, candidate, _ = match
-            pieces.append(replace(candidate, "name"))
-            index += len(candidate)
-        result = "".join(pieces)
+        if heuristic:
+            pieces: list[str] = []
+            index = 0
+            while index < len(result):
+                match = _heuristic_match_at(result, index)
+                if match is None:
+                    pieces.append(result[index])
+                    index += 1
+                    continue
+                _, candidate, _ = match
+                pieces.append(replace(candidate, "name"))
+                index += len(candidate)
+            result = "".join(pieces)
 
         result = _EMAIL_RE.sub(lambda match: replace(match.group(0), "email"), result)
         result = _RESIDENT_ID_RE.sub(

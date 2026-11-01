@@ -37,8 +37,13 @@ CASES = [
     ("list_courses", {"ids": [5, 6]}, "core_course_get_courses", {"options[ids][0]": "5", "options[ids][1]": "6"}),
     ("get_course_outline", {"course_id": 5}, "core_course_get_contents", {"courseid": "5"}),
     ("list_students", {"course_id": 5}, "core_enrol_get_enrolled_users", {"courseid": "5"}),
-    ("list_assignments", {}, "mod_assign_get_assignments", {}),
-    ("list_assignments", {"course_ids": [5]}, "mod_assign_get_assignments", {"courseids[0]": "5"}),
+    ("list_assignments", {}, "local_ubionai_list_course_assignments", {"offset": "0", "limit": "25"}),
+    (
+        "list_assignments",
+        {"course_ids": [5]},
+        "local_ubionai_get_course_assignments",
+        {"courseid": "5"},
+    ),
     (
         "get_submissions",
         {"assignment_ids": [9, 10]},

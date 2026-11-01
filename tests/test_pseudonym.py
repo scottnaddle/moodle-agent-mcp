@@ -1,3 +1,4 @@
+import json
 import logging
 import re
 import types
@@ -209,6 +210,68 @@ def test_top_level_user_markers_enable_field_masking():
     assert NAME_RE.fullmatch(masked["fullname"])
     assert EMAIL_RE.fullmatch(masked["email"])
     assert STUDENT_ID_RE.fullmatch(masked["idnumber"])
+
+
+def test_assignment_titles_skip_heuristic_but_keep_known_names():
+    p = Pseudonymizer()
+    payload = {
+        "assignments": [
+            {"id": 9, "name": "조별 과제 발표"},
+            {"id": 10, "name": "김민수 보충 과제"},
+        ],
+        "users": [{"id": 3, "fullname": "김민수"}],
+    }
+    masked = p.pseudonymize_value(payload, assignment_titles=True)
+    assert masked["assignments"][0]["name"] == "조별 과제 발표"
+    assert NAME_RE.fullmatch(masked["assignments"][1]["name"].split(" ")[0])
+    assert "김민수" not in json.dumps(masked, ensure_ascii=False)
+
+
+def test_non_assignment_names_keep_the_heuristic():
+    p = Pseudonymizer()
+    masked = p.pseudonymize_value(
+        {"sections": [{"name": "김민수 보충 수업"}]}, assignment_titles=True
+    )
+    assert "김민수" not in masked["sections"][0]["name"]
+
+
+def test_intro_free_text_still_heuristic():
+    p = Pseudonymizer()
+    masked = p.pseudonymize_value({"intro": "김민수 학생 제출"})
+    assert "김민수" not in masked["intro"]
+
+
+def test_pseudonymize_heuristic_flag_backward_compatible():
+    p = Pseudonymizer()
+    assert p.pseudonymize("홍길동", heuristic=True) == p.pseudonymize("홍길동")
+    assert "홍길동" in p.pseudonymize("홍길동", heuristic=False)
+
+
+def test_course_idnumber_does_not_trigger_user_masking():
+    p = Pseudonymizer()
+    payload = {
+        "courses": [
+            {
+                "id": 5,
+                "fullname": "데이터과학 입문",
+                "shortname": "DS101",
+                "idnumber": "DS-2026",
+            }
+        ]
+    }
+    masked = p.pseudonymize_value(payload)
+    assert masked["courses"][0]["fullname"] == "데이터과학 입문"
+    assert masked["courses"][0]["shortname"] == "DS101"
+    assert masked["courses"][0]["idnumber"] == "DS-2026"
+
+
+def test_user_with_only_id_and_fullname_under_users_still_masked():
+    p = Pseudonymizer()
+    masked = p.pseudonymize_value(
+        {"users": [{"id": 7, "fullname": "김민수", "idnumber": "20231234"}]}
+    )
+    assert NAME_RE.fullmatch(masked["users"][0]["fullname"])
+    assert STUDENT_ID_RE.fullmatch(masked["users"][0]["idnumber"])
 
 
 def test_pseudonymize_restore_does_not_log_pii(caplog):
