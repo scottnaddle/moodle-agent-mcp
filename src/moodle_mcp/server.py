@@ -362,7 +362,31 @@ def create_mcp(client: MoodleClient | None) -> FastMCP:
             obj = pseudonymizer.restore_value(obj)
         return json.dumps(obj, ensure_ascii=False)
 
-    async def call(wsfunction: str, key: str = "result", **params: Any) -> dict[str, Any]:
+    async def _seed_course_users(
+        active: MoodleClient, pseudonymizer: Pseudonymizer, result: Any
+    ) -> None:
+        courses = result.get("courses") if isinstance(result, dict) else None
+        if not isinstance(courses, list):
+            return
+        for course in courses:
+            if not isinstance(course, dict) or not course.get("assignments"):
+                continue
+            courseid = course.get("id")
+            if not isinstance(courseid, int):
+                continue
+            try:
+                users = await active.call("core_enrol_get_enrolled_users", courseid=courseid)
+            except MoodleError:
+                continue
+            pseudonymizer.seed(_wrap(users, "users"))
+
+    async def call(
+        wsfunction: str,
+        key: str = "result",
+        *,
+        assignment_listing: bool = False,
+        **params: Any,
+    ) -> dict[str, Any]:
         active = client or _request_client()
         if active is None:
             raise MoodleError("no tenant context")
@@ -381,7 +405,11 @@ def create_mcp(client: MoodleClient | None) -> FastMCP:
         except MoodleError as exc:
             result = {"error": str(exc)}
         if pseudonymizer is not None:
-            result = pseudonymizer.pseudonymize_value(result)
+            if assignment_listing:
+                await _seed_course_users(active, pseudonymizer, result)
+            result = pseudonymizer.pseudonymize_value(
+                result, assignment_titles=assignment_listing
+            )
         return result
 
     @mcp.tool()
@@ -421,7 +449,11 @@ def create_mcp(client: MoodleClient | None) -> FastMCP:
         offset = max(0, int(offset))
         limit = min(100, max(1, int(limit)))
 
-        res = await call("mod_assign_get_assignments", courseids=course_ids or None)
+        res = await call(
+            "mod_assign_get_assignments",
+            courseids=course_ids or None,
+            assignment_listing=True,
+        )
         if not isinstance(res, dict) or "error" in res:
             return res
 
@@ -432,7 +464,11 @@ def create_mcp(client: MoodleClient | None) -> FastMCP:
 
         if course_ids:
             for courseid in [cid for cid in course_ids if cid not in seen]:
-                extra = await call("local_ubionai_get_course_assignments", courseid=courseid)
+                extra = await call(
+                    "local_ubionai_get_course_assignments",
+                    courseid=courseid,
+                    assignment_listing=True,
+                )
                 if isinstance(extra, dict) and "error" not in extra:
                     for course in extra.get("courses", []):
                         if isinstance(course, dict):
@@ -448,7 +484,12 @@ def create_mcp(client: MoodleClient | None) -> FastMCP:
             return res
 
         # No course_ids: primary paged enumeration through the plugin.
-        page = await call("local_ubionai_list_course_assignments", offset=offset, limit=limit)
+        page = await call(
+            "local_ubionai_list_course_assignments",
+            offset=offset,
+            limit=limit,
+            assignment_listing=True,
+        )
         page_error = page.get("error") if isinstance(page, dict) else str(page)
         if isinstance(page, dict) and "error" not in page:
             # Core mod_assign results are only included on the first page; later pages
@@ -492,7 +533,11 @@ def create_mcp(client: MoodleClient | None) -> FastMCP:
 
         degraded_errors: list[dict[str, Any]] = []
         for courseid in window:
-            extra = await call("local_ubionai_get_course_assignments", courseid=courseid)
+            extra = await call(
+                "local_ubionai_get_course_assignments",
+                courseid=courseid,
+                assignment_listing=True,
+            )
             if isinstance(extra, dict) and "error" not in extra:
                 for course in extra.get("courses", []):
                     if isinstance(course, dict) and course.get("assignments"):

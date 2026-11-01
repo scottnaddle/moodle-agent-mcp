@@ -376,6 +376,7 @@ async def test_no_ids_output_pseudonymised():
             {
                 "mod_assign_get_assignments": {"courses": [], "warnings": []},
                 "local_ubionai_list_course_assignments": page,
+                "core_enrol_get_enrolled_users": [{"id": 7, "fullname": "김민수"}],
             }
         )
     finally:
@@ -387,7 +388,7 @@ async def test_no_ids_output_pseudonymised():
     assert result["courses"][0]["assignments"][1]["name"] == "조별 과제 발표"
 
 
-async def test_title_fields_are_not_heuristically_masked():
+async def test_enrolled_student_name_in_assignment_title_is_masked():
     page = {
         "courses": [
             {
@@ -403,18 +404,80 @@ async def test_title_fields_are_not_heuristically_masked():
     }
     token = _current_pseudonymizer.set(Pseudonymizer())
     try:
-        result, _calls = await call_list_assignments(
+        result, calls = await call_list_assignments(
             {
                 "mod_assign_get_assignments": {"courses": [], "warnings": []},
                 "local_ubionai_list_course_assignments": page,
+                "core_enrol_get_enrolled_users": [
+                    {"id": 7, "fullname": "김민수", "firstname": "민수", "lastname": "김"}
+                ],
             }
         )
     finally:
         _current_pseudonymizer.reset(token)
     rendered = json.dumps(result, ensure_ascii=False)
-    assert result["courses"][0]["assignments"][0]["name"] == "김민수 essay"
-    assert "김민수" in rendered
+    assert "김민수" not in rendered
+    assert PLACEHOLDER_RE.search(result["courses"][0]["assignments"][0]["name"])
+    assert [call["wsfunction"] for call in calls] == [
+        "mod_assign_get_assignments",
+        "local_ubionai_list_course_assignments",
+        "core_enrol_get_enrolled_users",
+    ]
+    assert calls[2]["courseid"] == "5"
+
+
+async def test_ordinary_assignment_title_stays_readable():
+    page = {
+        "courses": [
+            {
+                "id": 5,
+                "fullname": "Course",
+                "assignments": [{"id": 9, "name": "조별 과제"}],
+            }
+        ],
+        "total": 1,
+        "offset": 0,
+        "limit": 25,
+        "warnings": [],
+    }
+    token = _current_pseudonymizer.set(Pseudonymizer())
+    try:
+        result, _calls = await call_list_assignments(
+            {
+                "mod_assign_get_assignments": {"courses": [], "warnings": []},
+                "local_ubionai_list_course_assignments": page,
+                "core_enrol_get_enrolled_users": [{"id": 7, "fullname": "김민수"}],
+            }
+        )
+    finally:
+        _current_pseudonymizer.reset(token)
+    rendered = json.dumps(result, ensure_ascii=False)
+    assert result["courses"][0]["assignments"][0]["name"] == "조별 과제"
     assert PLACEHOLDER_RE.search(rendered) is None
+
+
+async def test_section_and_module_names_still_use_the_heuristic():
+    sections = [
+        {
+            "id": 1,
+            "name": "김민수 보충 수업",
+            "modules": [{"id": 2, "name": "박지훈 개별 상담"}],
+        }
+    ]
+    handler, _calls = make_handler({"core_course_get_contents": sections})
+    token = _current_pseudonymizer.set(Pseudonymizer())
+    try:
+        with respx.mock as router:
+            router.post(ENDPOINT).mock(side_effect=handler)
+            _content, result = await mcp().call_tool(
+                "get_course_outline", {"course_id": 5}
+            )
+    finally:
+        _current_pseudonymizer.reset(token)
+    rendered = json.dumps(result, ensure_ascii=False)
+    assert "김민수" not in rendered
+    assert "박지훈" not in rendered
+    assert len(PLACEHOLDER_RE.findall(rendered)) == 2
 
 
 def test_local_read_function_is_not_a_write():
@@ -441,6 +504,7 @@ async def test_fallback_output_is_pseudonymised():
             {
                 "mod_assign_get_assignments": {"courses": [], "warnings": []},
                 "local_ubionai_get_course_assignments": fallback,
+                "core_enrol_get_enrolled_users": [{"id": 7, "fullname": "김민수"}],
             },
             course_ids=[5],
         )

@@ -212,7 +212,7 @@ def test_top_level_user_markers_enable_field_masking():
     assert STUDENT_ID_RE.fullmatch(masked["idnumber"])
 
 
-def test_title_fields_skip_heuristic_but_keep_known_names():
+def test_assignment_titles_skip_heuristic_but_keep_known_names():
     p = Pseudonymizer()
     payload = {
         "assignments": [
@@ -221,10 +221,18 @@ def test_title_fields_skip_heuristic_but_keep_known_names():
         ],
         "users": [{"id": 3, "fullname": "김민수"}],
     }
-    masked = p.pseudonymize_value(payload)
+    masked = p.pseudonymize_value(payload, assignment_titles=True)
     assert masked["assignments"][0]["name"] == "조별 과제 발표"
     assert NAME_RE.fullmatch(masked["assignments"][1]["name"].split(" ")[0])
     assert "김민수" not in json.dumps(masked, ensure_ascii=False)
+
+
+def test_non_assignment_names_keep_the_heuristic():
+    p = Pseudonymizer()
+    masked = p.pseudonymize_value(
+        {"sections": [{"name": "김민수 보충 수업"}]}, assignment_titles=True
+    )
+    assert "김민수" not in masked["sections"][0]["name"]
 
 
 def test_intro_free_text_still_heuristic():
