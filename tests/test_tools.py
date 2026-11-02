@@ -196,11 +196,10 @@ async def test_create_course_preview_does_not_call_moodle(mcp):
     assert out["course"]["courseformatoptions"] == [{"name": "numsections", "value": "4"}]
 
 
-async def test_create_course_confirm_creates_and_enrols(mcp):
+async def create_course_confirmed(mcp, enrol_reply):
     replies = {
         "core_course_create_courses": [{"id": 42, "shortname": "S"}],
-        "core_webservice_get_site_info": {"userid": 10},
-        "enrol_manual_enrol_users": None,
+        "local_ubionai_enrol_course_creator": enrol_reply,
     }
     with respx.mock:
         route = respx.post(ENDPOINT).mock(
@@ -209,8 +208,42 @@ async def test_create_course_confirm_creates_and_enrols(mcp):
         _c, out = await mcp.call_tool(
             "create_course", {"fullname": "F", "shortname": "S", "categoryid": 1, "confirm": True}
         )
-        calls = [form(c.request) for c in route.calls]
-    assert out == {"ok": True, "courseid": 42, "shortname": "S", "enrolled_userid": 10}
+        return out, [form(c.request) for c in route.calls]
+
+
+async def test_create_course_confirm_creates_and_enrols(mcp):
+    out, calls = await create_course_confirmed(mcp, {"courseid": 42, "roleid": 3, "enrolled": True})
+    assert out == {"ok": True, "courseid": 42, "shortname": "S", "roleid": 3, "enrolled": True}
+    assert [c["wsfunction"] for c in calls] == ["core_course_create_courses", "local_ubionai_enrol_course_creator"]
     assert calls[0]["courses[0][fullname]"] == "F" and calls[0]["courses[0][categoryid]"] == "1"
-    assert calls[2]["enrolments[0][roleid]"] == "3"
-    assert calls[2]["enrolments[0][userid]"] == "10" and calls[2]["enrolments[0][courseid]"] == "42"
+    assert calls[1] == {**BASE, "wsfunction": "local_ubionai_enrol_course_creator", "courseid": "42"}
+
+
+async def test_create_course_already_enrolled_is_success(mcp):
+    out, _ = await create_course_confirmed(mcp, {"courseid": 42, "roleid": 3, "enrolled": False})
+    assert out == {"ok": True, "courseid": 42, "shortname": "S", "roleid": 3, "enrolled": False}
+
+
+@pytest.mark.parametrize(
+    "err",
+    [
+        {"exception": "dml_missing_record_exception", "errorcode": "invalidrecord",
+         "message": "Can't find data record in database table external_functions."},
+        {"exception": "webservice_access_exception", "errorcode": "accessexception",
+         "message": "Access control exception"},
+    ],
+)  # fmt: skip
+async def test_create_course_enrol_function_missing_falls_back(mcp, err):
+    out, _ = await create_course_confirmed(mcp, err)
+    assert out["ok"] is True and out["courseid"] == 42 and out["shortname"] == "S"
+    assert err["errorcode"] in out["enrol_error"]
+    assert "0.6.1-spike3" in out["note"] and "2026110202" in out["note"]
+    assert "강좌는 생성되었지만" in out["note"]
+
+
+async def test_create_course_enrol_other_error_keeps_course(mcp):
+    err = {"exception": "moodle_exception", "errorcode": "nopermissions", "message": "Sorry, no permission"}
+    out, _ = await create_course_confirmed(mcp, err)
+    assert out["ok"] is True and out["courseid"] == 42
+    assert "nopermissions" in out["enrol_error"]
+    assert "note" not in out

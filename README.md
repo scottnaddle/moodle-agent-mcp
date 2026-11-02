@@ -55,7 +55,7 @@ flowchart LR
 | 11 | `review_attempt` | 읽기 | Get the full review (questions, responses, marks) of a quiz attempt. |
 | 12 | `attendance_sessions` ⚠️선택 | 읽기 | List sessions (and attendance logs) of an attendance activity instance. |
 | 13 | `list_categories` | 읽기 | List course categories (id, name, parent, coursecount). |
-| 14 | `create_course` | 쓰기 | Create a course (core_course_create_courses) and enrol the bot as editingteacher. |
+| 14 | `create_course` | 쓰기 | Create a course (core_course_create_courses) and enrol the caller as editingteacher (local_ubionai_enrol_course_creator, plugin >= 0.6.1-spike3). |
 | 15 | `grade_submission` | 쓰기 | Save a grade and feedback comment for one student's assignment submission. |
 | 16 | `bulk_grade` | 쓰기 | Save grades and feedback for several students of one assignment at once. |
 | 17 | `create_assignment` | 쓰기 | Create an assignment in a course section. |

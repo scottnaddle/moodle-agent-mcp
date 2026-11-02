@@ -82,6 +82,7 @@ USER_SERVICE_FUNCTIONS = frozenset(
         "mod_assign_save_grade",
         "local_ubionai_create_module",
         "local_ubionai_update_module",
+        "local_ubionai_enrol_course_creator",
         "local_ubionai_get_course_assignments",
         "local_ubionai_list_course_assignments",
     }
