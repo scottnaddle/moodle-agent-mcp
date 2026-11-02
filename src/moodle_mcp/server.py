@@ -35,6 +35,7 @@ from .crypto import (
 )
 from .moodle import MoodleClient, MoodleError
 from .netutil import parse_ip_list
+from .oauth import OAuthConfigError, OAuthServer
 from .pseudonym import (
     DEFAULT_ASSIGNMENT_TITLE_HEURISTIC,
     Pseudonymizer,
@@ -48,6 +49,8 @@ _current_client: ContextVar[MoodleClient | None] = ContextVar("moodle_mcp_client
 _current_pseudonymizer: ContextVar[Pseudonymizer | None] = ContextVar(
     "moodle_mcp_pseudonymizer", default=None
 )
+# Moodle user id of an OAuth (per-teacher) request; None for the tenant/service token.
+_current_userid: ContextVar[int | None] = ContextVar("moodle_mcp_userid", default=None)
 
 
 class BodyTooLarge(Exception):
@@ -372,6 +375,22 @@ def create_mcp(client: MoodleClient | None) -> FastMCP:
             pass
         return _current_pseudonymizer.get()
 
+    def _request_userid() -> int | None:
+        try:
+            ctx = mcp.get_context()
+            request = ctx.request_context.request
+            if request is not None:
+                state = request.scope.get("state", {})
+                if "moodle_userid" in state:
+                    return state["moodle_userid"]
+        except (LookupError, ValueError, AttributeError, KeyError):
+            pass
+        return _current_userid.get()
+
+    async def _user_courses(userid: int) -> dict[str, Any]:
+        """Courses of a teacher token: core_course_get_courses needs moodle/course:view (admin-only)."""
+        return await call("core_enrol_get_users_courses", key="courses", userid=userid)
+
     def _dumps(obj: Any) -> str:
         pseudonymizer = _request_pseudonymizer()
         if pseudonymizer is not None:
@@ -458,7 +477,17 @@ def create_mcp(client: MoodleClient | None) -> FastMCP:
 
     @mcp.tool()
     async def list_courses(ids: list[int] | None = None) -> dict[str, Any]:
-        """List courses. Pass course ids to restrict, or omit for all visible courses."""
+        """List courses. Pass course ids to restrict, or omit for all visible courses.
+
+        For a teacher connection, lists only the courses the teacher is enrolled in.
+        """
+        userid = _request_userid()
+        if userid is not None:
+            res = await _user_courses(userid)
+            if ids and isinstance(res.get("courses"), list):
+                wanted = set(ids)
+                res["courses"] = [c for c in res["courses"] if isinstance(c, dict) and c.get("id") in wanted]
+            return res
         options = {"ids": ids} if ids else None
         return await call("core_course_get_courses", key="courses", options=options)
 
@@ -553,7 +582,8 @@ def create_mcp(client: MoodleClient | None) -> FastMCP:
             return res
 
         # Degraded fallback (0.4.x plugin or Connect not re-run after upgrade).
-        cc = await call("core_course_get_courses", key="courses")
+        userid = _request_userid()
+        cc = await (_user_courses(userid) if userid is not None else call("core_course_get_courses", key="courses"))
         if not isinstance(cc, dict) or "error" in cc or not isinstance(cc.get("courses"), list):
             res["hint"] = OPTIONAL_HINT.format(plugin="local_ubionai")
             return res
@@ -1789,10 +1819,14 @@ class TenantRouterMiddleware:
         registry: Registry,
         kek: Kek,
         pseudonymizers: _PseudonymizerStore | None = None,
+        oauth: OAuthServer | None = None,
+        moodle_transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self.app = app
         self.registry = registry
         self.pseudonymizers = pseudonymizers or _PseudonymizerStore(registry, kek)
+        self.oauth = oauth
+        self.moodle_transport = moodle_transport
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "lifespan":
@@ -1825,6 +1859,10 @@ class TenantRouterMiddleware:
             if CHAT_PATH_RE.fullmatch(raw_text) is None:
                 chat_match = None
         if match is None and chat_match is None:
+            raw_ok = not raw_path or raw_path.decode("latin-1") == path
+            if self.oauth is not None and raw_ok and self.oauth.handles(path):
+                await self.oauth(scope, receive, send)
+                return
             await _json(send, 404, {"error": "not found"})
             return
 
@@ -1849,11 +1887,26 @@ class TenantRouterMiddleware:
 
         site_id = match.group(1)
 
+        oauth_on = self.oauth is not None and self.oauth.enabled(site_id)
         bearer = _bearer_from_scope(scope)
         if bearer is None:
-            await _json(send, 401, {"error": "unauthorized"}, [(b"www-authenticate", b"Bearer")])
+            challenge = self.oauth.challenge(site_id) if oauth_on and self.oauth else b"Bearer"
+            await _json(send, 401, {"error": "unauthorized"}, [(b"www-authenticate", challenge)])
             return
+        # The tenant's static bearer keeps working; otherwise an OAuth access token of a teacher.
         tenant = self.registry.verify_bearer(site_id, bearer)
+        grant = None
+        if tenant is None and oauth_on and self.oauth is not None:
+            grant = self.oauth.authenticate(site_id, bearer)
+            tenant = self.registry.get(site_id) if grant is not None else None
+            if grant is None or tenant is None or tenant.status != "active":
+                await _json(
+                    send,
+                    401,
+                    {"error": "invalid_token"},
+                    [(b"www-authenticate", self.oauth.challenge(site_id, "invalid_token"))],
+                )
+                return
         if tenant is None:
             await _json(send, 403, {"error": "forbidden"})
             return
@@ -1861,25 +1914,37 @@ class TenantRouterMiddleware:
         token_buf: bytearray | None = None
         try:
             try:
-                token_buf = self.registry.moodle_token(tenant)
+                if grant is not None and self.oauth is not None:
+                    token_buf = self.oauth.user_token(tenant, grant)
+                else:
+                    token_buf = self.registry.moodle_token(tenant)
             except DecryptError:
                 logger.error("decrypt failed site=%s", site_id)
                 await _json(send, 500, {"error": "internal error"})
                 return
-            client = MoodleClient(ws_endpoint(tenant.moodle_url), token_buf)
+            client = MoodleClient(ws_endpoint(tenant.moodle_url), token_buf, transport=self.moodle_transport)
             pseudonymizer = self.pseudonymizers.get(
                 site_id, tenant.pseudonymize, tenant.assignment_title_heuristic
             )
             state = scope.setdefault("state", {})
             state["moodle_client"] = client
             state["pseudonymizer"] = pseudonymizer
+            userid = grant.moodle_userid if grant is not None else None
+            state["moodle_userid"] = userid
+            state["oauth_principal"] = (
+                self.oauth.principal_for_grant(grant)
+                if grant is not None and self.oauth is not None
+                else None
+            )
             scope["path"] = "/mcp"
             scope["raw_path"] = b"/mcp"
             context_token = _current_client.set(client)
             pseudonymizer_token = _current_pseudonymizer.set(pseudonymizer)
+            userid_token = _current_userid.set(userid)
             try:
                 await self.app(scope, receive, send)
             finally:
+                _current_userid.reset(userid_token)
                 _current_pseudonymizer.reset(pseudonymizer_token)
                 _current_client.reset(context_token)
         finally:
@@ -1894,6 +1959,8 @@ def create_app(
     bearer_token: str | None = None,
     hub_db: str | None = None,
     kek_file: str | None = None,
+    tenant_secrets_dir: str | None = None,
+    moodle_transport: httpx.AsyncBaseTransport | None = None,
 ) -> ASGIApp:
     """Build the full ASGI app. Values default to env vars."""
     db_path = hub_db if hub_db is not None else os.environ.get("UBIONAI_HUB_DB", "")
@@ -1936,8 +2003,31 @@ def create_app(
     except ValueError as exc:
         raise RuntimeError(f"UBIONAI_HUB_EGRESS_IP invalid: {exc}") from None
 
+    # Per-teacher OAuth (Easy Connect): on when a tenant secrets directory is configured;
+    # per site only when <dir>/<site>/oauth.secret exists. Off -> static bearers only, as before.
+    secrets_dir = (
+        tenant_secrets_dir
+        if tenant_secrets_dir is not None
+        else os.environ.get("UBIONAI_HUB_TENANT_SECRETS_DIR", "")
+    )
+    oauth: OAuthServer | None = None
+    if secrets_dir:
+        if not public_url:
+            raise RuntimeError("UBIONAI_HUB_PUBLIC_URL is required with UBIONAI_HUB_TENANT_SECRETS_DIR")
+        try:
+            oauth = OAuthServer(
+                registry,
+                kek,
+                public_url,
+                secrets_dir,
+                transport=moodle_transport,
+                require_token_resource=os.environ.get("UBIONAI_HUB_OAUTH_STRICT_RESOURCE") == "1",
+            )
+        except OAuthConfigError as exc:
+            raise RuntimeError(str(exc)) from None
+
     mcp = create_mcp(None)
     inner = RegisterEndpoint(
         mcp.streamable_http_app(), registry, kek, public_url, egress_ip
     )
-    return TenantRouterMiddleware(inner, registry, kek)
+    return TenantRouterMiddleware(inner, registry, kek, oauth=oauth, moodle_transport=moodle_transport)

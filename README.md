@@ -19,6 +19,7 @@
 | `client/moodle-mcp-remote.sh` | Grok Bot/아무 MCP 클라이언트용 stdio 래퍼 (mcp-remote) |
 | `scripts/smoke_test.py` | 설치 후 동작 확인 |
 | `INSTALL.md`, `ROLLBACK.md` | 설치 전 과정 / 업그레이드·롤백 |
+| `docs/OAUTH.md` | 허브 OAuth 2.1 (Easy Connect Phase 1) — 엔드포인트·환경변수·back-channel 계약·운영 런북 |
 | `docs/` | 통합 설계 메모, 프로젝트 브리프, 서버 영문 README |
 
 👉 **설치는 [INSTALL.md](INSTALL.md)를 순서대로 따라가면 됩니다.**
