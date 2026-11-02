@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import getpass
 import json
 import os
@@ -10,10 +11,19 @@ import re
 import secrets
 import stat
 import sys
+import time
 from datetime import datetime, timezone
 
+from . import oauth
 from .crypto import KekError, load_kek
-from .registry import ASSIGNMENT_TITLE_HEURISTICS, Registry, TenantError
+from .registry import (
+    ASSIGNMENT_TITLE_HEURISTICS,
+    OAuthClientInfo,
+    OAuthGrantInfo,
+    Registry,
+    Tenant,
+    TenantError,
+)
 
 
 def _read_secret(path: str) -> bytes:
@@ -69,7 +79,10 @@ def _parse_ttl(text: str | None) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="moodle-hub-admin")
+    parser = argparse.ArgumentParser(
+        prog="moodle-hub-admin",
+        epilog="oauth-revoke: default is dry-run; pass --yes to apply the changes.",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     add = sub.add_parser("add", help="add a tenant")
@@ -119,6 +132,33 @@ def build_parser() -> argparse.ArgumentParser:
     purge = sub.add_parser("purge-pseudonyms", help="delete expired pseudonym map rows")
     purge.add_argument("--site-id")
 
+    oauth_list = sub.add_parser(
+        "oauth-list", help="list a tenant's OAuth clients and grants (metadata only)"
+    )
+    oauth_list.add_argument("--site-id", required=True)
+    oauth_list.add_argument("--json", action="store_true")
+    oauth_list.add_argument("--include-revoked", action="store_true")
+
+    oauth_revoke = sub.add_parser(
+        "oauth-revoke",
+        help="revoke a tenant's OAuth grants and delete clients (default is dry-run)",
+    )
+    oauth_revoke.add_argument("--site-id", required=True)
+    target = oauth_revoke.add_mutually_exclusive_group(required=True)
+    target.add_argument("--client-id", help="target one OAuth client")
+    target.add_argument("--grant-id", help="target one teacher grant")
+    target.add_argument("--user-id", type=int, help="target every grant of one teacher")
+    target.add_argument("--all", action="store_true", help="target every grant and client")
+    oauth_revoke.add_argument(
+        "--delete-client", action="store_true", help="also delete the targeted client(s)"
+    )
+    mode = oauth_revoke.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true", help="explicit dry-run (the default)")
+    mode.add_argument("--yes", action="store_true", help="apply the changes (not a dry-run)")
+    oauth_revoke.add_argument(
+        "--skip-moodle", action="store_true", help="do not ask Moodle to revoke the tokens"
+    )
+
     return parser
 
 
@@ -134,6 +174,163 @@ def _metadata(tenant) -> dict[str, object]:
         "created_at": tenant.created_at,
         "updated_at": tenant.updated_at,
     }
+
+
+# --- OAuth (per-tenant clients and teacher grants) -----------------------------------------
+# Only public metadata is ever printed: no access/refresh token, no sealed Moodle token,
+# no token hash and no shared secret.
+
+
+def _client_meta(info: OAuthClientInfo) -> dict[str, object]:
+    return {
+        "client_id": info.client_id,
+        "source": info.source,
+        "client_name": info.client_name,
+        "created_at": info.created_at,
+        "active_grants": info.active_grants,
+    }
+
+
+def _grant_meta(info: OAuthGrantInfo) -> dict[str, object]:
+    return {
+        "grant_id": info.grant_id,
+        "moodle_userid": info.moodle_userid,
+        "client_id": info.client_id,
+        "scope": info.scope,
+        "created_at": info.created_at,
+        "valid_until": info.valid_until,
+        "revoked_at": info.revoked_at,
+        "live_tokens": info.live_tokens,
+    }
+
+
+async def _moodle_revoke(
+    tenant: Tenant, secret: bytes, issuer: str, userid: int, tokenid: int
+) -> bool:
+    """Ask the tenant's Moodle plugin to revoke one teacher token (back channel)."""
+    return await oauth.revoke_moodle_token(tenant, secret, issuer, userid, tokenid)
+
+
+def _oauth_list(
+    registry: Registry, site_id: str, as_json: bool, include_revoked: bool
+) -> int:
+    clients = registry.oauth_clients(site_id)
+    grants = registry.oauth_grants(site_id, include_revoked=include_revoked)
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "site_id": site_id,
+                    "clients": [_client_meta(client) for client in clients],
+                    "grants": [_grant_meta(grant) for grant in grants],
+                }
+            )
+        )
+        return 0
+    print(f"site={site_id}")
+    print("clients:")
+    if not clients:
+        print("  (none)")
+    for client in clients:
+        print(
+            f"  client_id={client.client_id} source={client.source} "
+            f"client_name={client.client_name or '-'} created_at={client.created_at} "
+            f"active_grants={client.active_grants}"
+        )
+    print("grants:")
+    if not grants:
+        print("  (none)")
+    for grant in grants:
+        revoked_at = "-" if grant.revoked_at is None else grant.revoked_at
+        print(
+            f"  grant_id={grant.grant_id} moodle_userid={grant.moodle_userid} "
+            f"client_id={grant.client_id} scope={grant.scope} created_at={grant.created_at} "
+            f"valid_until={grant.valid_until} revoked_at={revoked_at} "
+            f"live_tokens={grant.live_tokens}"
+        )
+    return 0
+
+
+def _oauth_targets(
+    registry: Registry, site_id: str, args
+) -> tuple[list[OAuthGrantInfo], list[str]]:
+    """Active grants to revoke and clients to delete for the given target selection."""
+    if args.all:
+        grants = registry.oauth_grants(site_id)
+        return grants, [client.client_id for client in registry.oauth_clients(site_id)]
+    if args.client_id:
+        grants = registry.oauth_grants(site_id, client_id=args.client_id)
+        return grants, [args.client_id] if args.delete_client else []
+    if args.grant_id:
+        grants = registry.oauth_grants(site_id, grant_id=args.grant_id)
+        clients = sorted({grant.client_id for grant in grants})
+        return grants, clients if args.delete_client else []
+    grants = registry.oauth_grants(site_id, moodle_userid=args.user_id)
+    clients = sorted({grant.client_id for grant in grants})
+    return grants, clients if args.delete_client else []
+
+
+def _oauth_revoke(registry: Registry, site_id: str, args) -> int:
+    tenant = registry.get(site_id)
+    if tenant is None:
+        print("error: site not found", file=sys.stderr)
+        return 1
+    grants, clients = _oauth_targets(registry, site_id, args)
+
+    if not args.yes:
+        for grant in grants:
+            print(
+                f"DRY-RUN would revoke grant={grant.grant_id} "
+                f"userid={grant.moodle_userid} client={grant.client_id}"
+            )
+        for client_id in clients:
+            print(f"DRY-RUN would delete client={client_id}")
+        print(f"grants={len(grants)} clients={len(clients)}")
+        return 0
+
+    changed = registry.oauth_revoke_grants(
+        site_id, [grant.grant_id for grant in grants], int(time.time())
+    )
+    revoked = {grant.grant_id for grant in grants} & set(changed)
+
+    issuer = None
+    public_url = (os.environ.get("UBIONAI_HUB_PUBLIC_URL") or "").strip()
+    if public_url:
+        try:
+            issuer = f"{oauth.validate_public_url(public_url)}/t/{site_id}"
+        except oauth.OAuthConfigError:
+            issuer = None
+    secrets_dir = (os.environ.get("UBIONAI_HUB_TENANT_SECRETS_DIR") or "").strip()
+    secret = oauth.load_tenant_secret(secrets_dir, site_id) if secrets_dir else None
+
+    partial = False
+    for grant in grants:
+        if grant.grant_id not in revoked:
+            continue
+        if args.skip_moodle or secret is None or issuer is None:
+            partial = True
+            print(
+                f"warning: moodle token not revoked grant={grant.grant_id} "
+                f"(expires {grant.valid_until})",
+                file=sys.stderr,
+            )
+            print(f"revoked grant={grant.grant_id} moodle=skipped")
+            continue
+        ok = asyncio.run(
+            _moodle_revoke(
+                tenant, secret, issuer, grant.moodle_userid, grant.moodle_tokenid
+            )
+        )
+        if not ok:
+            partial = True
+        print(f"revoked grant={grant.grant_id} moodle={'ok' if ok else 'failed'}")
+
+    if clients:
+        registry.oauth_delete_clients(site_id, clients)
+        for client_id in clients:
+            print(f"deleted client={client_id}")
+
+    return 3 if partial else 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -247,6 +444,17 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "purge-pseudonyms":
             print(f"purged {registry.pmap_purge(args.site_id)}")
             return 0
+
+        if args.command == "oauth-list":
+            if registry.get(args.site_id) is None:
+                print("error: site not found", file=sys.stderr)
+                return 1
+            return _oauth_list(
+                registry, args.site_id, args.json, args.include_revoked
+            )
+
+        if args.command == "oauth-revoke":
+            return _oauth_revoke(registry, args.site_id, args)
     except (TenantError, OSError, ValueError, KekError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
