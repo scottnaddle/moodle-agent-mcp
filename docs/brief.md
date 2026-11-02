@@ -6,8 +6,8 @@ Grok Bot 같은 AI 에이전트가 교수자 권한으로 Moodle(moodle.example.
 
 ## 무엇을 만들었나 (MCP 툴 16개)
 - 조회 13: site_info, list_courses, list_categories, get_course_outline, list_students, list_assignments, get_submissions, get_assignment_grades, gradebook_overview, list_quizzes, list_quiz_attempts, review_attempt, attendance_sessions
-- 쓰기 3: grade_submission, bulk_grade, create_course
-- 안전장치: create_course는 confirm=false 미리보기 → confirm=true 실행. 쓰기는 교수자(Scott)에게 대상·점수·피드백을 보여주고 확인받은 뒤에만 실행(채점 툴은 현재 설명 문구로 규정, confirm 플래그 추가는 결정 대기).
+- 쓰기 2: grade_submission, bulk_grade (create_course는 2026-11-02 정책 결정으로 제거 — AI는 기존 강좌에서만 작업)
+- 안전장치: 쓰기 도구는 confirm=false 미리보기 → confirm=true 실행. 쓰기는 교수자(Scott)에게 대상·점수·피드백을 보여주고 확인받은 뒤에만 실행(채점 툴은 현재 설명 문구로 규정, confirm 플래그 추가는 결정 대기).
 
 ## 구조
 Grok Bot(무들봇) → moodle-lms 커넥터(박스 stdio 래퍼, mcp-remote) → https://mcp.example.com/mcp (Cloudflare 프록시, Let's Encrypt TLS) → lms 서버 nginx vhost → 127.0.0.1:8791 Docker `moodle-mcp` → Moodle REST 웹서비스(전용 계정 grokbot, 외부 서비스 grokbot, 함수 30여 개)
