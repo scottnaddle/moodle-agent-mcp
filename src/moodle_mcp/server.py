@@ -477,7 +477,10 @@ def create_mcp(client: MoodleClient | None) -> FastMCP:
 
     @mcp.tool()
     async def list_courses(ids: list[int] | None = None) -> dict[str, Any]:
-        """List courses. Pass course ids to restrict, or omit for all visible courses."""
+        """List courses. Pass course ids to restrict, or omit for all visible courses.
+
+        For a teacher connection, lists only the courses the teacher is enrolled in.
+        """
         userid = _request_userid()
         if userid is not None:
             res = await _user_courses(userid)
