@@ -111,8 +111,19 @@ OPTIONAL_HINT = (
     "This tool needs the optional Moodle plugin {plugin}. If it is not installed (or its web service functions "
     "are not in the external service), this tool cannot work; all other tools are unaffected."
 )
-EDITINGTEACHER_ROLE_ID = int(os.environ.get("MOODLE_EDITINGTEACHER_ROLE_ID") or "3")  # blank in .env -> default
 WRITE_NOTE = "WRITE - only call after the teacher confirmed."
+# Moodle error codes / messages meaning a WS function is not installed or not in the token's service.
+MISSING_FUNCTION_RE = re.compile(
+    r"\[(invalidrecord|accessexception|webservice_access_exception|servicenotavailable)\]"
+    r"|external_functions|webservice_access_exception",
+    re.IGNORECASE,
+)
+ENROL_CREATOR_UNAVAILABLE = (
+    "강좌는 생성되었지만 생성자 자동 등록(교사 권한)은 수행되지 않았습니다. "
+    "local_ubionai 플러그인 0.6.1-spike3 (2026110202) 이상이 필요합니다. / "
+    "The course was created, but auto-enrolling the creator as teacher was skipped: "
+    "it needs the local_ubionai plugin >= 0.6.1-spike3 (2026110202)."
+)
 CONFIRM_NOTE = "Call first with confirm=false to get a preview; call again with confirm=true after the teacher agrees."
 PREVIEW_NOTE = "Nothing changed. Re-call with confirm=true."
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024
@@ -130,6 +141,7 @@ VIMEO_RE = re.compile(r"vimeo\.com/(?:video/)?(\d+)")
 WRITE_FUNCTIONS = frozenset(
     {
         "core_course_create_courses",
+        "local_ubionai_enrol_course_creator",
         "enrol_manual_enrol_users",
         "mod_assign_save_grade",
         "mod_assign_save_grades",
@@ -689,7 +701,8 @@ def create_mcp(client: MoodleClient | None) -> FastMCP:
         return await call("core_course_get_categories", key="categories")
 
     @mcp.tool(
-        description=f"{WRITE_NOTE} Create a course (core_course_create_courses) and enrol the bot as editingteacher. "
+        description=f"{WRITE_NOTE} Create a course (core_course_create_courses) and enrol the caller as editingteacher "
+        "(local_ubionai_enrol_course_creator). "
         "Call first with confirm=false to get a preview; call again with confirm=true after the teacher agrees. "
         "format: topics|weeks|singleactivity|social. startdate: unix timestamp."
     )
@@ -723,18 +736,16 @@ def create_mcp(client: MoodleClient | None) -> FastMCP:
         if "error" in created:
             return created
         courseid = created["courses"][0]["id"]
-        info = await call("core_webservice_get_site_info")
-        if "error" in info:
-            return {"ok": True, "courseid": courseid, "enrol_error": info["error"]}
-        enrol = await call(
-            "enrol_manual_enrol_users",
-            enrolments=[{"roleid": EDITINGTEACHER_ROLE_ID, "userid": info["userid"], "courseid": courseid}],
-        )
         out: dict[str, Any] = {"ok": True, "courseid": courseid, "shortname": created["courses"][0].get("shortname")}
+        # The plugin enrols the calling user as editingteacher; enrolled=false means already enrolled.
+        enrol = await call("local_ubionai_enrol_course_creator", courseid=courseid)
         if "error" in enrol:
             out["enrol_error"] = enrol["error"]
+            if MISSING_FUNCTION_RE.search(str(enrol["error"])):
+                out["note"] = ENROL_CREATOR_UNAVAILABLE
         else:
-            out["enrolled_userid"] = info["userid"]
+            out["roleid"] = enrol.get("roleid")
+            out["enrolled"] = bool(enrol.get("enrolled"))
         return out
 
     @mcp.tool(description=f"{WRITE_NOTE} Save a grade and feedback comment for one student's assignment submission.")
