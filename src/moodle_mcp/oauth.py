@@ -88,41 +88,6 @@ USER_SERVICE_FUNCTIONS = frozenset(
     }
 )
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS oauth_clients (
-  site_id       TEXT NOT NULL,
-  client_id     TEXT NOT NULL,
-  redirect_uris TEXT NOT NULL,
-  client_name   TEXT,
-  source        TEXT NOT NULL CHECK (source IN ('dcr','cimd')),
-  created_at    INTEGER NOT NULL,
-  PRIMARY KEY (site_id, client_id)
-);
-CREATE TABLE IF NOT EXISTS oauth_grants (
-  grant_id       TEXT PRIMARY KEY,
-  site_id        TEXT NOT NULL,
-  moodle_userid  INTEGER NOT NULL,
-  client_id      TEXT NOT NULL,
-  scope          TEXT NOT NULL,
-  resource       TEXT NOT NULL,
-  wstoken_ct     BLOB NOT NULL,
-  moodle_tokenid INTEGER NOT NULL,
-  valid_until    INTEGER NOT NULL,
-  kek_id         TEXT NOT NULL,
-  created_at     INTEGER NOT NULL,
-  revoked_at     INTEGER
-);
-CREATE TABLE IF NOT EXISTS oauth_tokens (
-  token_hash BLOB PRIMARY KEY,
-  kind       TEXT NOT NULL CHECK (kind IN ('access','refresh')),
-  grant_id   TEXT NOT NULL,
-  expires_at INTEGER NOT NULL,
-  used_at    INTEGER
-);
-CREATE INDEX IF NOT EXISTS oauth_tokens_grant ON oauth_tokens(grant_id);
-CREATE INDEX IF NOT EXISTS oauth_grants_site_user ON oauth_grants(site_id, moodle_userid);
-"""
-
 
 class OAuthConfigError(Exception):
     """Raised for invalid OAuth configuration (public URL, secret files)."""
@@ -202,6 +167,48 @@ def load_tenant_secret(secrets_dir: str, site_id: str) -> bytes | None:
         logger.error("oauth secret shorter than %d bytes site=%s", MIN_SECRET_LEN, site_id)
         return None
     return secret
+
+
+async def _post_backchannel(
+    url: str, assertion: str, transport: httpx.AsyncBaseTransport | None
+) -> httpx.Response | None:
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=False, transport=transport) as client:
+            return await client.post(url, data={"assertion": assertion})
+    except httpx.HTTPError as exc:
+        logger.warning("back channel failed: %s", type(exc).__name__)
+        return None
+
+
+async def revoke_moodle_token(
+    tenant: Tenant,
+    secret: bytes,
+    issuer: str,
+    userid: int,
+    tokenid: int,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> bool:
+    """Ask the tenant's Moodle plugin to revoke one teacher token (back channel)."""
+    assertion = sign_message(
+        secret,
+        {
+            "typ": "revoke",
+            "iss": issuer,
+            "aud": tenant.moodle_url,
+            "site": tenant.site_id,
+            "userid": userid,
+            "tokenid": tokenid,
+            "jti": secrets.token_urlsafe(12),
+            "exp": _now() + BACKCHANNEL_TTL,
+        },
+    )
+    resp = await _post_backchannel(
+        f"{tenant.moodle_url}/local/ubionai/oauth/revoke.php", assertion, transport
+    )
+    ok = resp is not None and resp.status_code == 200
+    if not ok:
+        logger.warning("moodle revoke failed site=%s userid=%s", tenant.site_id, userid)
+    return ok
 
 
 def _is_loopback_host(host: str) -> bool:
@@ -539,9 +546,6 @@ class OAuthServer:
 
     def __post_init__(self) -> None:
         self.public_url = validate_public_url(self.public_url)
-        with self.registry._connect() as conn:
-            conn.executescript(_SCHEMA)
-            conn.execute("UPDATE meta SET schema_version = 5 WHERE schema_version < 5")
         self.router = Starlette(routes=self._routes())
 
     # --- tenancy / urls -------------------------------------------------------------------
@@ -863,12 +867,7 @@ class OAuthServer:
         return response
 
     async def _post(self, url: str, assertion: str) -> httpx.Response | None:
-        try:
-            async with httpx.AsyncClient(timeout=10, follow_redirects=False, transport=self.transport) as client:
-                return await client.post(url, data={"assertion": assertion})
-        except httpx.HTTPError as exc:
-            logger.warning("back channel failed: %s", type(exc).__name__)
-            return None
+        return await _post_backchannel(url, assertion, self.transport)
 
     async def callback(self, request: Request) -> Response:
         self._purge()
@@ -969,24 +968,9 @@ class OAuthServer:
         if not found:
             return False
         tenant, secret = found
-        assertion = sign_message(
-            secret,
-            {
-                "typ": "revoke",
-                "iss": self.issuer(site),
-                "aud": tenant.moodle_url,
-                "site": site,
-                "userid": userid,
-                "tokenid": tokenid,
-                "jti": secrets.token_urlsafe(12),
-                "exp": _now() + BACKCHANNEL_TTL,
-            },
+        return await revoke_moodle_token(
+            tenant, secret, self.issuer(site), userid, tokenid, transport=self.transport
         )
-        resp = await self._post(f"{tenant.moodle_url}/local/ubionai/oauth/revoke.php", assertion)
-        ok = resp is not None and resp.status_code == 200
-        if not ok:
-            logger.warning("moodle revoke failed site=%s userid=%s", site, userid)
-        return ok
 
     # --- token ----------------------------------------------------------------------------
     def _issue(self, grant_id: str, scope: str) -> dict[str, Any]:
@@ -1020,14 +1004,8 @@ class OAuthServer:
         return (Grant(*row[:9]), row[9]) if row else None
 
     async def revoke_grant(self, grant: Grant) -> None:
-        with self.registry._connect() as conn:
-            cur = conn.execute(
-                "UPDATE oauth_grants SET revoked_at = ? WHERE grant_id = ? AND revoked_at IS NULL",
-                (_now(), grant.grant_id),
-            )
-            conn.execute("UPDATE oauth_tokens SET used_at = ? WHERE grant_id = ? AND used_at IS NULL",
-                         (_now(), grant.grant_id))
-        if cur.rowcount:
+        changed = self.registry.oauth_revoke_grants(grant.site_id, [grant.grant_id], _now())
+        if changed:
             await self._revoke_moodle(grant.site_id, grant.moodle_userid, grant.moodle_tokenid)
 
     async def token(self, request: Request) -> Response:

@@ -12,7 +12,7 @@ import time
 import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Iterator
+from typing import Iterable, Iterator
 from urllib.parse import urlsplit, urlunsplit
 
 from cryptography.exceptions import InvalidTag
@@ -47,7 +47,10 @@ _PMAP_NONCE_LEN = 12
 # Assignment-title name heuristic per tenant (see pseudonym.HEURISTIC_MODES).
 ASSIGNMENT_TITLE_HEURISTICS = ("full", "title", "off")
 
-_SCHEMA = """
+# Schema v5: the OAuth tables live here so every entry point (hub, admin CLI) finds them.
+SCHEMA_VERSION = 5
+
+_SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS meta (
   schema_version INTEGER NOT NULL
 );
@@ -84,7 +87,39 @@ CREATE TABLE IF NOT EXISTS pseudonym_map (
   expires_at  INTEGER NOT NULL,
   PRIMARY KEY (site_id, placeholder)
 );
-INSERT INTO meta(schema_version) SELECT 4 WHERE NOT EXISTS (SELECT 1 FROM meta);
+CREATE TABLE IF NOT EXISTS oauth_clients (
+  site_id       TEXT NOT NULL,
+  client_id     TEXT NOT NULL,
+  redirect_uris TEXT NOT NULL,
+  client_name   TEXT,
+  source        TEXT NOT NULL CHECK (source IN ('dcr','cimd')),
+  created_at    INTEGER NOT NULL,
+  PRIMARY KEY (site_id, client_id)
+);
+CREATE TABLE IF NOT EXISTS oauth_grants (
+  grant_id       TEXT PRIMARY KEY,
+  site_id        TEXT NOT NULL,
+  moodle_userid  INTEGER NOT NULL,
+  client_id      TEXT NOT NULL,
+  scope          TEXT NOT NULL,
+  resource       TEXT NOT NULL,
+  wstoken_ct     BLOB NOT NULL,
+  moodle_tokenid INTEGER NOT NULL,
+  valid_until    INTEGER NOT NULL,
+  kek_id         TEXT NOT NULL,
+  created_at     INTEGER NOT NULL,
+  revoked_at     INTEGER
+);
+CREATE TABLE IF NOT EXISTS oauth_tokens (
+  token_hash BLOB PRIMARY KEY,
+  kind       TEXT NOT NULL CHECK (kind IN ('access','refresh')),
+  grant_id   TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,
+  used_at    INTEGER
+);
+CREATE INDEX IF NOT EXISTS oauth_tokens_grant ON oauth_tokens(grant_id);
+CREATE INDEX IF NOT EXISTS oauth_grants_site_user ON oauth_grants(site_id, moodle_userid);
+INSERT INTO meta(schema_version) SELECT {SCHEMA_VERSION} WHERE NOT EXISTS (SELECT 1 FROM meta);
 """
 
 
@@ -117,6 +152,32 @@ class Tenant:
     updated_at: int
     pseudonymize: bool = True
     assignment_title_heuristic: str = "title"
+
+
+@dataclass(frozen=True)
+class OAuthClientInfo:
+    """Public metadata of a registered OAuth client (never a secret)."""
+
+    client_id: str
+    source: str
+    client_name: str | None
+    created_at: int
+    active_grants: int
+
+
+@dataclass(frozen=True)
+class OAuthGrantInfo:
+    """Public metadata of a teacher grant (never a sealed token or a token hash)."""
+
+    grant_id: str
+    moodle_userid: int
+    client_id: str
+    scope: str
+    created_at: int
+    valid_until: int
+    revoked_at: int | None
+    moodle_tokenid: int
+    live_tokens: int
 
 
 def normalize_moodle_url(url: str, allow_http: bool = False) -> str:
@@ -193,13 +254,15 @@ class Registry:
                 )
             row = conn.execute("SELECT schema_version FROM meta").fetchone()
             if row is None:
-                conn.execute("INSERT INTO meta(schema_version) VALUES (4)")
+                conn.execute("INSERT INTO meta(schema_version) VALUES (?)", (SCHEMA_VERSION,))
             else:
                 if row[0] < 3:
                     registry._migrate_aad(conn)
                     conn.execute("UPDATE meta SET schema_version = 3")
                 if row[0] < 4:
                     conn.execute("UPDATE meta SET schema_version = 4")
+                if row[0] < SCHEMA_VERSION:
+                    conn.execute("UPDATE meta SET schema_version = ?", (SCHEMA_VERSION,))
         return registry
 
     def _migrate_aad(self, conn: sqlite3.Connection) -> None:
@@ -522,10 +585,103 @@ class Registry:
 
     def delete(self, site_id: str) -> None:
         with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM oauth_tokens WHERE grant_id IN"
+                " (SELECT grant_id FROM oauth_grants WHERE site_id = ?)",
+                (site_id,),
+            )
+            conn.execute("DELETE FROM oauth_grants WHERE site_id = ?", (site_id,))
+            conn.execute("DELETE FROM oauth_clients WHERE site_id = ?", (site_id,))
             conn.execute("DELETE FROM pseudonym_map WHERE site_id = ?", (site_id,))
             cur = conn.execute("DELETE FROM tenants WHERE site_id = ?", (site_id,))
             if cur.rowcount == 0:
                 raise TenantNotFound("site not found")
+
+    # --- OAuth ---------------------------------------------------------------------------
+    def oauth_clients(self, site_id: str) -> list[OAuthClientInfo]:
+        """Registered OAuth clients of a site with their number of non-revoked grants."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT c.client_id, c.source, c.client_name, c.created_at,"
+                " (SELECT COUNT(*) FROM oauth_grants g WHERE g.site_id = c.site_id"
+                "  AND g.client_id = c.client_id AND g.revoked_at IS NULL)"
+                " FROM oauth_clients c WHERE c.site_id = ? ORDER BY c.client_id",
+                (site_id,),
+            ).fetchall()
+        return [OAuthClientInfo(*row) for row in rows]
+
+    def oauth_grants(
+        self,
+        site_id: str,
+        *,
+        client_id: str | None = None,
+        moodle_userid: int | None = None,
+        grant_id: str | None = None,
+        include_revoked: bool = False,
+    ) -> list[OAuthGrantInfo]:
+        """Teacher grants of a site. ``live_tokens`` counts unused, unexpired tokens."""
+        now = _now()
+        sql = (
+            "SELECT g.grant_id, g.moodle_userid, g.client_id, g.scope, g.created_at,"
+            " g.valid_until, g.revoked_at, g.moodle_tokenid,"
+            " (SELECT COUNT(*) FROM oauth_tokens t WHERE t.grant_id = g.grant_id"
+            "  AND t.used_at IS NULL AND t.expires_at > ?)"
+            " FROM oauth_grants g WHERE g.site_id = ?"
+        )
+        params: list[object] = [now, site_id]
+        if client_id is not None:
+            sql += " AND g.client_id = ?"
+            params.append(client_id)
+        if moodle_userid is not None:
+            sql += " AND g.moodle_userid = ?"
+            params.append(moodle_userid)
+        if grant_id is not None:
+            sql += " AND g.grant_id = ?"
+            params.append(grant_id)
+        if not include_revoked:
+            sql += " AND g.revoked_at IS NULL"
+        sql += " ORDER BY g.created_at, g.grant_id"
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [OAuthGrantInfo(*row) for row in rows]
+
+    def oauth_revoke_grants(self, site_id: str, grant_ids: Iterable[str], now: int) -> list[str]:
+        """Revoke grants of a site and burn their tokens; returns the ids that changed."""
+        now = int(now)
+        changed: list[str] = []
+        with self._connect() as conn:
+            for grant_id in grant_ids:
+                cur = conn.execute(
+                    "UPDATE oauth_grants SET revoked_at = ? WHERE grant_id = ? AND site_id = ?"
+                    " AND revoked_at IS NULL",
+                    (now, grant_id, site_id),
+                )
+                conn.execute(
+                    "UPDATE oauth_tokens SET used_at = ? WHERE grant_id = ? AND used_at IS NULL",
+                    (now, grant_id),
+                )
+                if cur.rowcount:
+                    changed.append(grant_id)
+        return changed
+
+    def oauth_delete_clients(self, site_id: str, client_ids: Iterable[str]) -> int:
+        """Delete clients of a site; refuses while they still hold non-revoked grants."""
+        deleted = 0
+        with self._connect() as conn:
+            for client_id in client_ids:
+                active = conn.execute(
+                    "SELECT COUNT(*) FROM oauth_grants WHERE site_id = ? AND client_id = ?"
+                    " AND revoked_at IS NULL",
+                    (site_id, client_id),
+                ).fetchone()[0]
+                if active:
+                    raise TenantError(f"client still has active grants: {client_id}")
+                cur = conn.execute(
+                    "DELETE FROM oauth_clients WHERE site_id = ? AND client_id = ?",
+                    (site_id, client_id),
+                )
+                deleted += cur.rowcount
+        return deleted
 
     def list(self) -> list[Tenant]:
         with self._connect() as conn:

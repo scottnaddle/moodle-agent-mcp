@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import os
 import sqlite3
 import time
@@ -137,7 +138,7 @@ def test_assignment_title_heuristic_roundtrip(tmp_path):
     assert registry.get("site-a").assignment_title_heuristic == "off"
 
 
-def test_schema_v1_migrates_to_v4(tmp_path):
+def test_schema_v1_migrates_to_v5(tmp_path):
     db = tmp_path / "old.sqlite3"
     with sqlite3.connect(db) as conn:
         conn.executescript(
@@ -172,7 +173,7 @@ def test_schema_v1_migrates_to_v4(tmp_path):
     assert tenant.pseudonymize is True
     assert tenant.assignment_title_heuristic == "title"
     with sqlite3.connect(db) as conn:
-        assert conn.execute("SELECT schema_version FROM meta").fetchone()[0] == 4
+        assert conn.execute("SELECT schema_version FROM meta").fetchone()[0] == 5
         columns = {row[1] for row in conn.execute("PRAGMA table_info(tenants)")}
         assert "pseudonymize" in columns
         assert "assignment_title_heuristic" in columns
@@ -181,6 +182,7 @@ def test_schema_v1_migrates_to_v4(tmp_path):
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
         assert "pseudonym_map" in tables
+        assert "oauth_clients" in tables
 
 
 def test_registration_codes_are_atomic_and_expire(tmp_path):
@@ -195,7 +197,7 @@ def test_registration_codes_are_atomic_and_expire(tmp_path):
     assert registry.claim_code("not-" + unknown, now) is None
 
 
-def test_schema_v3_migrates_to_v4(tmp_path):
+def test_schema_v3_migrates_to_v5(tmp_path):
     db = tmp_path / "v3.sqlite3"
     with sqlite3.connect(db) as conn:
         conn.executescript(
@@ -225,10 +227,146 @@ def test_schema_v3_migrates_to_v4(tmp_path):
         )
     registry = Registry.open(str(db), make_kek())
     with sqlite3.connect(db) as conn:
-        assert conn.execute("SELECT schema_version FROM meta").fetchone()[0] == 4
+        assert conn.execute("SELECT schema_version FROM meta").fetchone()[0] == 5
         tables = {
             row[0]
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
         assert "pseudonym_map" in tables
+        assert "oauth_clients" in tables
     assert registry.kek_ids() == set()
+
+
+def _oauth_tables(conn):
+    return {
+        row[0]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+
+
+def _insert_oauth_rows(db, site_id, client_id, grant_id, kek_id, userid=3, tokenid=101):
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO oauth_clients (site_id, client_id, redirect_uris, client_name, source,"
+            " created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (site_id, client_id, '["https://claude.ai/api/mcp/auth_callback"]', client_id, "dcr", 1000),
+        )
+        conn.execute(
+            "INSERT INTO oauth_grants (grant_id, site_id, moodle_userid, client_id, scope, resource,"
+            " wstoken_ct, moodle_tokenid, valid_until, kek_id, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (grant_id, site_id, userid, client_id, "moodle:read", f"https://hub.test/t/{site_id}/mcp",
+             b"\x00" * 16, tokenid, 4102444800, kek_id, 1000),
+        )
+        conn.execute(
+            "INSERT INTO oauth_tokens (token_hash, kind, grant_id, expires_at, used_at)"
+            " VALUES (?, 'access', ?, ?, NULL)",
+            (hashlib.sha256(grant_id.encode()).digest(), grant_id, 4102444800),
+        )
+
+
+def test_schema_v4_migrates_to_v5(tmp_path):
+    db = tmp_path / "v4.sqlite3"
+    registry = Registry.open(str(db), make_kek())
+    registry.add("site-a", "https://a.example", b"token-a", None, "bearer-a")
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE meta SET schema_version = 4")
+    upgraded = Registry.open(str(db), make_kek())
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT schema_version FROM meta").fetchone()[0] == 5
+        assert {"oauth_clients", "oauth_grants", "oauth_tokens"} <= _oauth_tables(conn)
+        assert conn.execute("SELECT COUNT(*) FROM tenants").fetchone()[0] == 1
+    tenant = upgraded.get("site-a")
+    assert tenant is not None
+    assert tenant.moodle_url == "https://a.example"
+    assert upgraded.verify_bearer("site-a", "bearer-a") is not None
+
+
+def test_open_twice_keeps_schema_and_oauth_tables(tmp_path):
+    db = tmp_path / "hub.sqlite3"
+    first = Registry.open(str(db), make_kek())
+    first.add("site-a", "https://a.example", b"token-a", None, "bearer-a")
+    second = Registry.open(str(db), make_kek())
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT schema_version FROM meta").fetchone()[0] == 5
+        assert {"oauth_clients", "oauth_grants", "oauth_tokens"} <= _oauth_tables(conn)
+    assert second.get("site-a") is not None
+
+
+def test_delete_cascades_oauth_rows_of_that_site(tmp_path):
+    db = tmp_path / "hub.sqlite3"
+    kek = make_kek()
+    registry = Registry.open(str(db), kek)
+    registry.add("site-a", "https://a.example", b"token-a", None, "bearer-a")
+    registry.add("site-b", "https://b.example", b"token-b", None, "bearer-b")
+    _insert_oauth_rows(db, "site-a", "client-a", "grant-a", kek.kek_id)
+    _insert_oauth_rows(db, "site-b", "client-b", "grant-b", kek.kek_id)
+    registry.delete("site-a")
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM oauth_clients WHERE site_id = 'site-a'").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM oauth_grants WHERE site_id = 'site-a'").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM oauth_tokens WHERE grant_id = 'grant-a'"
+        ).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM oauth_clients WHERE site_id = 'site-b'").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM oauth_grants WHERE site_id = 'site-b'").fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM oauth_tokens WHERE grant_id = 'grant-b'"
+        ).fetchone()[0] == 1
+    assert registry.get("site-a") is None
+    assert registry.get("site-b") is not None
+
+
+def test_oauth_listings_carry_no_secret_fields(tmp_path):
+    db = tmp_path / "hub.sqlite3"
+    kek = make_kek()
+    registry = Registry.open(str(db), kek)
+    registry.add("site-a", "https://a.example", b"token-a", None, "bearer-a")
+    _insert_oauth_rows(db, "site-a", "client-a", "grant-a", kek.kek_id)
+    client = registry.oauth_clients("site-a")[0]
+    grant = registry.oauth_grants("site-a")[0]
+    for info in (client, grant):
+        assert not hasattr(info, "wstoken_ct")
+        assert not hasattr(info, "token_hash")
+    assert client.client_id == "client-a"
+    assert client.source == "dcr"
+    assert client.active_grants == 1
+    assert grant.grant_id == "grant-a"
+    assert grant.moodle_userid == 3
+    assert grant.live_tokens == 1
+    assert grant.revoked_at is None
+
+
+def test_oauth_grants_filters_and_revocation(tmp_path):
+    db = tmp_path / "hub.sqlite3"
+    kek = make_kek()
+    registry = Registry.open(str(db), kek)
+    registry.add("site-a", "https://a.example", b"token-a", None, "bearer-a")
+    _insert_oauth_rows(db, "site-a", "client-a", "grant-a", kek.kek_id, userid=3)
+    _insert_oauth_rows(db, "site-a", "client-b", "grant-b", kek.kek_id, userid=9, tokenid=202)
+    assert [g.grant_id for g in registry.oauth_grants("site-a")] == ["grant-a", "grant-b"]
+    assert [g.grant_id for g in registry.oauth_grants("site-a", client_id="client-b")] == ["grant-b"]
+    assert [g.grant_id for g in registry.oauth_grants("site-a", moodle_userid=3)] == ["grant-a"]
+    assert [g.grant_id for g in registry.oauth_grants("site-a", grant_id="grant-b")] == ["grant-b"]
+    assert registry.oauth_grants("site-a", client_id="missing") == []
+    assert registry.oauth_revoke_grants("site-a", ["grant-a"], 1700000000) == ["grant-a"]
+    assert registry.oauth_revoke_grants("site-a", ["grant-a"], 1700000001) == []
+    assert [g.grant_id for g in registry.oauth_grants("site-a")] == ["grant-b"]
+    revoked = registry.oauth_grants("site-a", include_revoked=True)
+    assert [g.grant_id for g in revoked] == ["grant-a", "grant-b"]
+    assert revoked[0].revoked_at == 1700000000
+    assert revoked[0].live_tokens == 0
+
+
+def test_oauth_delete_clients_refuses_active_grants(tmp_path):
+    db = tmp_path / "hub.sqlite3"
+    kek = make_kek()
+    registry = Registry.open(str(db), kek)
+    registry.add("site-a", "https://a.example", b"token-a", None, "bearer-a")
+    _insert_oauth_rows(db, "site-a", "client-a", "grant-a", kek.kek_id)
+    with pytest.raises(TenantError):
+        registry.oauth_delete_clients("site-a", ["client-a"])
+    assert registry.oauth_clients("site-a") != []
+    registry.oauth_revoke_grants("site-a", ["grant-a"], 1700000000)
+    assert registry.oauth_delete_clients("site-a", ["client-a"]) == 1
+    assert registry.oauth_clients("site-a") == []
