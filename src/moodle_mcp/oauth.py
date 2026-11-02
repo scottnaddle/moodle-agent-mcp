@@ -38,7 +38,7 @@ import socket
 import stat
 import time
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Protocol, runtime_checkable
 from urllib.parse import urlencode, urlsplit
 
 import httpx
@@ -249,6 +249,14 @@ def redirect_matches(registered: list[str], requested: str) -> bool:
     return False
 
 
+RedirectPolicy = Callable[[str, Tenant], bool]
+
+
+def default_redirect_policy(uri: str, tenant: Tenant) -> bool:
+    """The hub-wide allowlist (Claude callbacks + loopback); the tenant is not used yet."""
+    return redirect_allowed(uri)
+
+
 def _user_field(grant_id: str, userid: int) -> str:
     return f"user_wstoken:{grant_id}:{userid}"
 
@@ -304,6 +312,30 @@ class Grant:
     wstoken_ct: bytes
     moodle_tokenid: int
     valid_until: int
+
+
+@dataclass(frozen=True)
+class OAuthPrincipal:
+    """Who a request acts as: one teacher of one site, through one OAuth client."""
+
+    site_id: str
+    moodle_userid: int
+    client_id: str
+    scope: frozenset[str]
+    grant_id: str
+
+
+@runtime_checkable
+class TeacherCredentialSource(Protocol):
+    """Access token -> principal -> the teacher's own Moodle token, whatever path asks for it."""
+
+    def principal(self, site_id: str, access_token: str) -> OAuthPrincipal | None: ...
+
+    def moodle_token(self, tenant: Tenant, principal: OAuthPrincipal) -> bytearray: ...
+
+
+class OAuthCredentialError(Exception):
+    """A principal does not map to a usable teacher credential."""
 
 
 class CimdError(Exception):
@@ -540,6 +572,8 @@ class OAuthServer:
     cimd_fetcher: CimdFetcher = field(default_factory=CimdFetcher)
     access_ttl: int = ACCESS_TTL
     refresh_ttl: int = REFRESH_TTL
+    require_token_resource: bool = False
+    redirect_policy: RedirectPolicy = default_redirect_policy
     requests: dict[str, AuthRequest] = field(default_factory=dict)
     codes: dict[bytes, PendingCode] = field(default_factory=dict)
     _tasks: set[asyncio.Task[Any]] = field(default_factory=set)
@@ -610,6 +644,33 @@ class OAuthServer:
             moodle_url=tenant.moodle_url,
         )
 
+    # --- principal / credentials (the interface a future AI block reuses) ------------------
+    def principal_for_grant(self, grant: Grant) -> OAuthPrincipal:
+        return OAuthPrincipal(
+            site_id=grant.site_id,
+            moodle_userid=grant.moodle_userid,
+            client_id=grant.client_id,
+            scope=frozenset(grant.scope.split()),
+            grant_id=grant.grant_id,
+        )
+
+    def principal(self, site_id: str, access_token: str) -> OAuthPrincipal | None:
+        """Access token -> principal of that teacher (None when the token is not live)."""
+        grant = self.authenticate(site_id, access_token)
+        return self.principal_for_grant(grant) if grant is not None else None
+
+    def moodle_token(self, tenant: Tenant, principal: OAuthPrincipal) -> bytearray:
+        """The teacher's own Moodle token for a principal (sealed at rest, opened here)."""
+        found = self._grant(principal.grant_id)
+        if found is None:
+            raise OAuthCredentialError("unknown grant")
+        grant, revoked_at = found
+        if revoked_at is not None:
+            raise OAuthCredentialError("grant is revoked")
+        if grant.site_id != tenant.site_id:
+            raise OAuthCredentialError("grant belongs to another site")
+        return self.user_token(tenant, grant)
+
     # --- ASGI -----------------------------------------------------------------------------
     def handles(self, path: str) -> bool:
         return path.startswith("/.well-known/") or bool(
@@ -675,9 +736,11 @@ class OAuthServer:
 
     # --- clients --------------------------------------------------------------------------
     async def register(self, request: Request) -> Response:
-        site = self._site(request)
-        if not site:
+        site = request.path_params["site"]
+        found = self.tenant(site)
+        if not found:
             return JSONResponse({"error": "not found"}, status_code=404)
+        tenant = found[0]
         try:
             body = await request.json()
         except (ValueError, json.JSONDecodeError):
@@ -687,7 +750,7 @@ class OAuthServer:
         uris = body.get("redirect_uris")
         if not isinstance(uris, list) or not uris or not all(isinstance(u, str) for u in uris):
             return _oauth_error("invalid_redirect_uri", "redirect_uris required")
-        bad = [u for u in uris if not redirect_allowed(u)]
+        bad = [u for u in uris if not self.redirect_policy(u, tenant)]
         if bad:
             return _oauth_error("invalid_redirect_uri", f"redirect_uri not allowed: {bad[0]}")
         if body.get("token_endpoint_auth_method", "none") != "none":
@@ -782,7 +845,11 @@ class OAuthServer:
         if client is None:
             return _page("invalid client_id", 400)
         redirect_uri = q.get("redirect_uri", "")
-        if not redirect_uri or not redirect_allowed(redirect_uri) or not redirect_matches(client.redirect_uris, redirect_uri):
+        if (
+            not redirect_uri
+            or not self.redirect_policy(redirect_uri, tenant)
+            or not redirect_matches(client.redirect_uris, redirect_uri)
+        ):
             return _page("invalid redirect_uri", 400)
         client_state = q.get("state")
 
@@ -1023,6 +1090,12 @@ class OAuthServer:
         resource = form.get("resource")
         if resource is not None and resource != self.resource(site):
             return _oauth_error("invalid_target", "resource mismatch")
+        if (
+            resource is None
+            and self.require_token_resource
+            and grant_type in ("authorization_code", "refresh_token")
+        ):
+            return _oauth_error("invalid_target", "resource required")
 
         if grant_type == "authorization_code":
             code = self.codes.pop(_hash(str(form.get("code") or "")), None)

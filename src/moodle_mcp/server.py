@@ -1931,6 +1931,11 @@ class TenantRouterMiddleware:
             state["pseudonymizer"] = pseudonymizer
             userid = grant.moodle_userid if grant is not None else None
             state["moodle_userid"] = userid
+            state["oauth_principal"] = (
+                self.oauth.principal_for_grant(grant)
+                if grant is not None and self.oauth is not None
+                else None
+            )
             scope["path"] = "/mcp"
             scope["raw_path"] = b"/mcp"
             context_token = _current_client.set(client)
@@ -2010,7 +2015,14 @@ def create_app(
         if not public_url:
             raise RuntimeError("UBIONAI_HUB_PUBLIC_URL is required with UBIONAI_HUB_TENANT_SECRETS_DIR")
         try:
-            oauth = OAuthServer(registry, kek, public_url, secrets_dir, transport=moodle_transport)
+            oauth = OAuthServer(
+                registry,
+                kek,
+                public_url,
+                secrets_dir,
+                transport=moodle_transport,
+                require_token_resource=os.environ.get("UBIONAI_HUB_OAUTH_STRICT_RESOURCE") == "1",
+            )
         except OAuthConfigError as exc:
             raise RuntimeError(str(exc)) from None
 

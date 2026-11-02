@@ -22,9 +22,17 @@ from starlette.testclient import TestClient
 
 from moodle_mcp import oauth as oauth_mod
 from moodle_mcp.crypto import load_kek
-from moodle_mcp.oauth import USER_SERVICE_FUNCTIONS, sign_message, verify_message
-from moodle_mcp.registry import Registry
-from moodle_mcp.server import create_app
+from moodle_mcp.oauth import (
+    USER_SERVICE_FUNCTIONS,
+    OAuthPrincipal,
+    TeacherCredentialSource,
+    default_redirect_policy,
+    redirect_allowed,
+    sign_message,
+    verify_message,
+)
+from moodle_mcp.registry import Registry, Tenant
+from moodle_mcp.server import TenantRouterMiddleware, create_app
 
 SITE = "demo"
 MOODLE = "https://moodle.test"
@@ -138,7 +146,12 @@ def _secret_dir(tmp_path, site=SITE, mode=0o600, value=SECRET):
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
-    for name in ("MOODLE_TOKEN", "MCP_BEARER_TOKEN", "UBIONAI_HUB_TENANT_SECRETS_DIR"):
+    for name in (
+        "MOODLE_TOKEN",
+        "MCP_BEARER_TOKEN",
+        "UBIONAI_HUB_TENANT_SECRETS_DIR",
+        "UBIONAI_HUB_OAUTH_STRICT_RESOURCE",
+    ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.delenv("UBIONAI_HUB_ALLOW_HTTP", raising=False)
     kek_file = tmp_path / "kek"
@@ -380,6 +393,21 @@ def _tokens(client, moodle, userid=3):
     })
     assert resp.status_code == 200, resp.text
     return client_id, resp.json()
+
+
+def _token_request(client, moodle, extra=None, userid=3):
+    """Log in, then post an authorization_code token request (extra fields override the default)."""
+    client_id, verifier, back = _login(client, moodle, userid)
+    code = _q(back)["code"]
+    data = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "client_id": client_id,
+        "redirect_uri": REDIRECT,
+        "code_verifier": verifier,
+    }
+    data.update(extra or {})
+    return client_id, client.post(f"/t/{SITE}/oauth/token", data=data)
 
 
 def _mcp(client, bearer, site=SITE, tool="site_info", args=None):
@@ -870,3 +898,146 @@ def test_signing_roundtrip_rejects_tampering():
     body, mac = token.split(".")
     assert verify_message(SECRET, body + "." + mac[:-2] + "AA", "revoke") is None
     assert verify_message(SECRET, sign_message(SECRET, {"typ": "revoke", "exp": 1}), "revoke") is None
+
+
+# --- spec hardening (PKCE, resource), principal interface, redirect policy -----------------
+
+
+@pytest.mark.parametrize(
+    "challenge,method",
+    [
+        (None, None),
+        ("x" * 43, "plain"),
+        ("x" * 42, "S256"),
+        ("x" * 44, "S256"),
+    ],
+)
+def test_pkce_rejections(hub, challenge, method):
+    client, _, _ = hub
+    client_id = _register(client).json()["client_id"]
+    resp = _authorize(client, client_id, challenge, method=method)
+    assert resp.status_code == 302
+    assert _q(resp)["error"] == "invalid_request"
+
+
+def test_pkce_verifier_mismatch_is_invalid_grant(hub):
+    client, moodle, _ = hub
+    client_id, verifier, back = _login(client, moodle)
+    code = _q(back)["code"]
+    resp = client.post(f"/t/{SITE}/oauth/token", data={
+        "grant_type": "authorization_code", "code": code, "client_id": client_id,
+        "redirect_uri": REDIRECT, "code_verifier": secrets.token_urlsafe(48),
+    })
+    assert resp.status_code == 400 and resp.json()["error"] == "invalid_grant"
+    assert verifier not in code
+
+
+def test_as_metadata_s256_only(hub):
+    client, _, _ = hub
+    for path in (
+        f"/.well-known/oauth-authorization-server/t/{SITE}",
+        f"/.well-known/openid-configuration/t/{SITE}",
+        f"/t/{SITE}/.well-known/openid-configuration",
+    ):
+        meta = client.get(path).json()
+        assert meta["code_challenge_methods_supported"] == ["S256"]
+
+
+def test_token_resource_missing_allowed_by_default(hub):
+    client, moodle, _ = hub
+    _, resp = _token_request(client, moodle)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["token_type"] == "Bearer"
+
+
+def test_token_resource_missing_rejected_when_strict(env, monkeypatch):
+    monkeypatch.setenv("UBIONAI_HUB_OAUTH_STRICT_RESOURCE", "1")
+    app, moodle = _app(env, monkeypatch)
+    with TestClient(app, base_url="https://hub.test", follow_redirects=False) as client:
+        _, resp = _token_request(client, moodle)
+        assert resp.status_code == 400 and resp.json()["error"] == "invalid_target"
+
+
+def test_refresh_resource_missing_rejected_when_strict(env, monkeypatch):
+    app, moodle = _app(env, monkeypatch)
+    with TestClient(app, base_url="https://hub.test", follow_redirects=False) as client:
+        client_id, tokens = _tokens(client, moodle)
+    monkeypatch.setenv("UBIONAI_HUB_OAUTH_STRICT_RESOURCE", "1")
+    app, _ = _app(env, monkeypatch)
+    with TestClient(app, base_url="https://hub.test", follow_redirects=False) as client:
+        resp = client.post(f"/t/{SITE}/oauth/token", data={
+            "grant_type": "refresh_token", "refresh_token": tokens["refresh_token"],
+            "client_id": client_id,
+        })
+        assert resp.status_code == 400 and resp.json()["error"] == "invalid_target"
+
+
+def test_token_resource_mismatch_always_rejected(hub, env, monkeypatch):
+    client, moodle, _ = hub
+    wrong = f"https://hub.test/t/other/mcp"
+    _, resp = _token_request(client, moodle, {"resource": wrong})
+    assert resp.status_code == 400 and resp.json()["error"] == "invalid_target"
+    monkeypatch.setenv("UBIONAI_HUB_OAUTH_STRICT_RESOURCE", "1")
+    app, moodle = _app(env, monkeypatch)
+    with TestClient(app, base_url="https://hub.test", follow_redirects=False) as client:
+        _, resp = _token_request(client, moodle, {"resource": wrong})
+        assert resp.status_code == 400 and resp.json()["error"] == "invalid_target"
+
+
+async def test_principal_set_for_oauth_request_none_for_static_bearer(hub):
+    client, moodle, env = hub
+    client_id, tokens = _tokens(client, moodle)
+    registry = env["registry"]
+    kek = load_kek(env["kek"])
+    server = oauth_mod.OAuthServer(
+        registry, kek, "https://hub.test", env["secrets"],
+        transport=httpx.MockTransport(moodle.handler),
+    )
+    assert isinstance(server, TeacherCredentialSource)
+    seen: dict = {}
+
+    async def capture(scope, receive, send):
+        seen.clear()
+        seen.update(scope.get("state", {}))
+
+    middleware = TenantRouterMiddleware(capture, registry, kek, oauth=server)
+
+    async def call(bearer):
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": f"/t/{SITE}/mcp",
+            "headers": [(b"authorization", f"Bearer {bearer}".encode())],
+        }
+        await middleware(scope, None, None)
+
+    await call(TENANT_BEARER)
+    assert seen["moodle_userid"] is None
+    assert seen["oauth_principal"] is None
+
+    await call(tokens["access_token"])
+    principal = seen["oauth_principal"]
+    assert isinstance(principal, OAuthPrincipal)
+    assert principal.site_id == SITE
+    assert principal.moodle_userid == 3
+    assert principal.client_id == client_id
+    assert principal.scope == frozenset({"moodle:read", "moodle:write"})
+    assert principal.grant_id
+    tenant = registry.get(SITE)
+    assert server.moodle_token(tenant, principal).startswith(b"user-token-3-")
+
+
+def test_default_redirect_policy_equals_allowlist():
+    tenant = Tenant(
+        site_id=SITE, moodle_url=MOODLE, bearer_hash=b"x", token_ct=b"x", litellm_ct=None,
+        kek_id="kek", status="active", created_at=0, updated_at=0,
+    )
+    for uri in (
+        "https://claude.ai/api/mcp/auth_callback",
+        "https://claude.com/api/mcp/auth_callback",
+        "http://127.0.0.1:53682/callback",
+        "http://localhost:8080/callback",
+        "https://evil.example/cb",
+        "",
+    ):
+        assert default_redirect_policy(uri, tenant) is redirect_allowed(uri)
