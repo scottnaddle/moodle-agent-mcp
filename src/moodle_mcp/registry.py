@@ -52,7 +52,7 @@ _PMAP_NONCE_LEN = 12
 # Assignment-title name heuristic per tenant (see pseudonym.HEURISTIC_MODES).
 ASSIGNMENT_TITLE_HEURISTICS = ("full", "title", "off")
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 TENANT_STATUSES = ("active", "pending", "disabled")
 
 _TENANTS_V6_COLUMNS = """
@@ -153,6 +153,21 @@ CREATE TABLE IF NOT EXISTS site_registrations (
 CREATE INDEX IF NOT EXISTS site_registrations_host ON site_registrations(host_key, created_at);
 """
 
+# Schema v7 (docs/OPERATOR-LINK.md): an operator tenant may be linked to its host for
+# self-registration (tenants.link_approved_at, added by ALTER when missing); every link/unlink is
+# audited here. No secrets.
+_SCHEMA_V7_EXTRA = """
+CREATE TABLE IF NOT EXISTS operator_link_audit (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  site_id    TEXT NOT NULL,
+  host_key   TEXT,
+  action     TEXT NOT NULL CHECK (action IN ('link','unlink')),
+  actor      TEXT,
+  detail     TEXT,
+  created_at INTEGER NOT NULL
+);
+"""
+
 
 
 class TenantError(Exception):
@@ -194,10 +209,21 @@ class Tenant:
     consent_version: str | None = None
     consent_at: int | None = None
     last_verified_at: int | None = None
+    link_approved_at: int | None = None
 
     @property
     def self_registered(self) -> bool:
         return self.origin == "self_registered"
+
+    @property
+    def operator_linked(self) -> bool:
+        """Operator tenant whose host may self-register (``link-host``, decision #4)."""
+        return self.origin == "operator" and self.link_approved_at is not None
+
+    @property
+    def uses_site_secret(self) -> bool:
+        """Accepts the shared-secret credential family (register / confirm / rotate / status)."""
+        return self.self_registered or self.operator_linked
 
 
 def normalize_moodle_url(url: str, allow_http: bool = False) -> str:
@@ -294,6 +320,10 @@ class Registry:
             if "host_key" not in columns:
                 registry._migrate_v6(conn)
             conn.executescript(_SCHEMA_V6_EXTRA)
+            columns = {info[1] for info in conn.execute("PRAGMA table_info(tenants)")}
+            if "link_approved_at" not in columns:
+                conn.execute("ALTER TABLE tenants ADD COLUMN link_approved_at INTEGER")
+            conn.executescript(_SCHEMA_V7_EXTRA)
             conn.execute(
                 "UPDATE meta SET schema_version = ? WHERE schema_version < ?",
                 (SCHEMA_VERSION, SCHEMA_VERSION),
@@ -405,6 +435,7 @@ class Registry:
             consent_version=row[18],
             consent_at=row[19],
             last_verified_at=row[20],
+            link_approved_at=row[21],
         )
 
     @staticmethod
@@ -413,7 +444,7 @@ class Registry:
             "site_id, moodle_url, token_ct, litellm_ct, bearer_hash, kek_id, "
             "status, created_at, updated_at, pseudonymize, assignment_title_heuristic, "
             "host_key, origin, tier, auth_mode, site_identifier_hash, plugin_version, "
-            "moodle_release, consent_version, consent_at, last_verified_at"
+            "moodle_release, consent_version, consent_at, last_verified_at, link_approved_at"
         )
 
     def add(
@@ -542,6 +573,113 @@ class Registry:
                 f"SELECT {self._select_columns()} FROM tenants WHERE host_key = ?", (host_key,)
             ).fetchone()
         return self._tenant(row) if row is not None else None
+
+    def link_host(self, site_id: str, host_key: str, actor: str | None = None) -> tuple[Tenant, bool]:
+        """Approve self-registration of ``host_key`` for an operator tenant (decision #4).
+
+        Returns the tenant and whether this call changed anything. Refuses self-registered
+        tenants, a host_key held by another tenant and a tenant routed under another host_key.
+        """
+        now = _now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                f"SELECT {self._select_columns()} FROM tenants WHERE site_id = ?", (site_id,)
+            ).fetchone()
+            if row is None:
+                raise TenantNotFound("site not found")
+            tenant = self._tenant(row)
+            if tenant.origin != "operator":
+                raise TenantError("only operator tenants can be linked (this site is self-registered)")
+            other = conn.execute(
+                "SELECT site_id FROM tenants WHERE host_key = ? AND site_id != ?", (host_key, site_id)
+            ).fetchone()
+            if other is not None:
+                raise TenantError(f"host_key {host_key} already belongs to site={other[0]}")
+            if tenant.host_key is not None and tenant.host_key != host_key:
+                raise TenantError(f"site={site_id} is routed as host_key {tenant.host_key}; refusing to re-route")
+            if tenant.host_key == host_key and tenant.link_approved_at is not None:
+                return tenant, False
+            conn.execute(
+                "UPDATE tenants SET host_key = ?, link_approved_at = ?, updated_at = ? WHERE site_id = ?",
+                (host_key, now, now, site_id),
+            )
+            self._link_audit(conn, site_id, host_key, "link", actor, None, now)
+        return self._require(site_id), True
+
+    def unlink_host(self, site_id: str, actor: str | None = None) -> tuple[Tenant, int]:
+        """Withdraw the link: shared-secret credentials deleted, ``/m/`` grants revoked.
+
+        ``host_key`` and everything on ``/t/`` (token, bearer, oauth.secret, grants) are kept.
+        Returns the tenant and the number of revoked grants.
+        """
+        now = _now()
+        revoked = 0
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                f"SELECT {self._select_columns()} FROM tenants WHERE site_id = ?", (site_id,)
+            ).fetchone()
+            if row is None:
+                raise TenantNotFound("site not found")
+            tenant = self._tenant(row)
+            if not tenant.operator_linked:
+                raise TenantError(f"site={site_id} is not linked")
+            conn.execute("DELETE FROM site_credentials WHERE site_id = ?", (site_id,))
+            if tenant.host_key is not None:
+                revoked = self._revoke_host_grants(conn, site_id, tenant.host_key, now)
+            conn.execute(
+                "UPDATE tenants SET link_approved_at = NULL, updated_at = ? WHERE site_id = ?", (now, site_id)
+            )
+            self._link_audit(conn, site_id, tenant.host_key, "unlink", actor, f"revoked_grants={revoked}", now)
+        return self._require(site_id), revoked
+
+    def revoke_host_grants(self, site_id: str, host_key: str) -> int:
+        """Revoke the teacher grants issued for ``/m/<host_key>/mcp`` only (``/t/`` grants stay)."""
+        with self._connect() as conn:
+            return self._revoke_host_grants(conn, site_id, host_key, _now())
+
+    @staticmethod
+    def _revoke_host_grants(conn: sqlite3.Connection, site_id: str, host_key: str, now: int) -> int:
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'oauth_grants'"
+        ).fetchone() is None:
+            return 0
+        suffix = f"/m/{host_key}/mcp"
+        where = "site_id = ? AND revoked_at IS NULL AND substr(resource, -?) = ?"
+        params = (site_id, len(suffix), suffix)
+        conn.execute(
+            f"UPDATE oauth_tokens SET used_at = ? WHERE used_at IS NULL AND grant_id IN"
+            f" (SELECT grant_id FROM oauth_grants WHERE {where})",
+            (now, *params),
+        )
+        return conn.execute(f"UPDATE oauth_grants SET revoked_at = ? WHERE {where}", (now, *params)).rowcount
+
+    @staticmethod
+    def _link_audit(
+        conn: sqlite3.Connection, site_id: str, host_key: str | None, action: str,
+        actor: str | None, detail: str | None, now: int,
+    ) -> None:
+        conn.execute(
+            "INSERT INTO operator_link_audit (site_id, host_key, action, actor, detail, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (site_id, host_key, action, actor, detail, now),
+        )
+        logger.warning("operator %s site=%s host_key=%s actor=%s %s", action, site_id, host_key, actor, detail or "")
+
+    def link_audit(self, site_id: str | None = None) -> list[tuple[str, str | None, str, str | None, str | None, int]]:
+        with self._connect() as conn:
+            if site_id is None:
+                rows = conn.execute(
+                    "SELECT site_id, host_key, action, actor, detail, created_at FROM operator_link_audit ORDER BY id"
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT site_id, host_key, action, actor, detail, created_at FROM operator_link_audit"
+                    " WHERE site_id = ? ORDER BY id",
+                    (site_id,),
+                ).fetchall()
+        return [tuple(row) for row in rows]
 
     def site_identifier_elsewhere(self, site_identifier_hash: bytes, host_key: str) -> bool:
         """Another host already registered with the same Moodle siteidentifier (cloned DB?)."""

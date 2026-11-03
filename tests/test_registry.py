@@ -172,7 +172,7 @@ def test_schema_v1_migrates_to_v6(tmp_path):
     assert tenant.pseudonymize is True
     assert tenant.assignment_title_heuristic == "title"
     with sqlite3.connect(db) as conn:
-        assert conn.execute("SELECT schema_version FROM meta").fetchone()[0] == 6
+        assert conn.execute("SELECT schema_version FROM meta").fetchone()[0] == 7  # v7 (operator link) follows v6
         columns ={row[1] for row in conn.execute("PRAGMA table_info(tenants)")}
         assert "pseudonymize" in columns
         assert "assignment_title_heuristic" in columns
@@ -225,7 +225,7 @@ def test_schema_v3_migrates_to_v6(tmp_path):
         )
     registry = Registry.open(str(db), make_kek())
     with sqlite3.connect(db) as conn:
-        assert conn.execute("SELECT schema_version FROM meta").fetchone()[0] == 6
+        assert conn.execute("SELECT schema_version FROM meta").fetchone()[0] == 7  # v7 (operator link) follows v6
         tables = {
             row[0]
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")

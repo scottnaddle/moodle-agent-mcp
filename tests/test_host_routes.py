@@ -111,12 +111,34 @@ def test_host_routes_flag_off_is_404_everywhere(env):
         assert data["mcp_url"] is None and data["oauth"]["issuers"] == [f"{HUB}/t/{data['site_key']}"]
 
 
-# --- unregistered hosts: static OAuth surface + page ----------------------------------------
+# --- unknown hosts: 404; registered-but-not-ready hosts: static OAuth surface + page ----------
 
 
-def test_unregistered_host_static_surface(env):
+def test_unknown_host_is_404_everywhere(env):
     client, site, dns, app = _client(env)
     with client:
+        for path in (f"/m/{HOST_KEY}/mcp", f"/m/{HOST_KEY}/oauth/register", f"/m/{HOST_KEY}/oauth/token",
+                     f"/.well-known/oauth-protected-resource/m/{HOST_KEY}/mcp",
+                     f"/.well-known/oauth-authorization-server/m/{HOST_KEY}",
+                     f"/.well-known/openid-configuration/m/{HOST_KEY}",
+                     f"/m/{HOST_KEY}/.well-known/openid-configuration",
+                     "/m/LMS.school.example/moodle/mcp"):
+            for method in ("GET", "POST"):
+                resp = client.request(method, path, headers={"Authorization": "Bearer nope"})
+                assert resp.status_code == 404, (method, path)
+                assert resp.json() == {"error": "not found"} and "www-authenticate" not in resp.headers
+    with sqlite3.connect(env["db"]) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM oauth_clients").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM tenants").fetchone()[0] == 0
+    assert dns.calls == [] and site.seen == []
+
+
+def test_registered_not_ready_host_static_surface(env):
+    client, site, dns, app = _client(env)
+    with client:
+        assert client.post("/api/v1/sites/register", json=site.new_registration()).status_code == 201
+        dns.calls.clear()
+        seen = len(site.seen)
         unauth = client.post(f"/m/{HOST_KEY}/mcp", json={})
         assert unauth.status_code == 401
         assert unauth.headers["www-authenticate"].startswith(
@@ -137,8 +159,7 @@ def test_unregistered_host_static_surface(env):
         assert client.post(f"/m/{HOST_KEY}/oauth/token", data={"grant_type": "x"}).status_code == 404
     with sqlite3.connect(env["db"]) as conn:
         assert conn.execute("SELECT COUNT(*) FROM oauth_clients").fetchone()[0] == 0  # nothing stored
-        assert conn.execute("SELECT COUNT(*) FROM tenants").fetchone()[0] == 0
-    assert dns.calls == [] and site.seen == []  # no outbound lookups for arbitrary hosts
+    assert dns.calls == [] and len(site.seen) == seen  # no outbound lookups
 
 
 def test_unregistered_page_is_escaped_static_and_locked_down(env):
@@ -190,6 +211,13 @@ def test_pending_and_disabled_pages(env):
         assert resp.status_code == 403 and "사용할 수 없습니다" in resp.text
 
 
+def _known_hosts(env):
+    """Unknown hosts are 404 before canonicalisation matters: give both test hosts a tenant."""
+    reg = _registry(env)
+    reg.add("school-op", "https://lms.school.example/moodle", b"op-token", None, "op-bearer")
+    reg.add("kr-op", "https://xn--3e0b707e.kr", b"op-token", None, "op-bearer-2")
+
+
 @pytest.mark.parametrize(
     "path, canonical",
     [
@@ -202,6 +230,7 @@ def test_pending_and_disabled_pages(env):
 )
 def test_non_canonical_urls(env, path, canonical):
     client, *_ = _client(env)
+    _known_hosts(env)
     with client:
         resp = client.post(path, json={})
     assert resp.status_code == 400
@@ -210,6 +239,7 @@ def test_non_canonical_urls(env, path, canonical):
 
 def test_non_canonical_authorize_page_and_unsupported_hosts(env):
     client, *_ = _client(env)
+    _known_hosts(env)
     with client:
         page = client.get("/m/LMS.school.example/moodle/oauth/authorize")
         assert page.status_code == 400 and f"{HUB}/m/{HOST_KEY}/oauth/authorize" in page.text
@@ -225,12 +255,15 @@ def test_non_canonical_authorize_page_and_unsupported_hosts(env):
 def test_self_registered_oauth_flow_and_audience_separation(env):
     client, site, dns, app = _client(env)
     with client:
+        data = client.post("/api/v1/sites/register", json=site.new_registration()).json()
         early = client.post(f"/m/{HOST_KEY}/oauth/register", json={"redirect_uris": [REDIRECT]}).json()["client_id"]
-        data = _register_and_confirm(client, site)
+        site.adopt(data)
         key = data["site_key"]
+        assert client.post(f"/api/v1/sites/{key}/confirm", json={"secret_version": data["secret_version"]},
+                           headers={"Authorization": f"Bearer {data['site_secret']}"}).status_code == 200
         m_base, t_base = f"/m/{HOST_KEY}", f"/t/{key}"
 
-        # The stateless client_id issued before registration still works afterwards.
+        # The stateless client_id issued before the confirm still works afterwards.
         m_tokens = _login(client, site, m_base, early)
         resp = _mcp(client, f"{m_base}/mcp", m_tokens["access_token"])
         assert resp.status_code == 200, resp.text
@@ -260,8 +293,10 @@ def test_self_registered_oauth_flow_and_audience_separation(env):
 def test_forged_stateless_client_ids_are_refused(env):
     client, site, _, app = _client(env)
     with client:
+        data = client.post("/api/v1/sites/register", json=site.new_registration()).json()
         good = client.post(f"/m/{HOST_KEY}/oauth/register", json={"redirect_uris": [REDIRECT]}).json()["client_id"]
-        _register_and_confirm(client, site)
+        assert client.post(f"/api/v1/sites/{data['site_key']}/confirm", json={"secret_version": data["secret_version"]},
+                           headers={"Authorization": f"Bearer {data['site_secret']}"}).status_code == 200
         prefix, body, mac = good.split(".")
         payload = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
         payload["r"] = ["http://127.0.0.1:9/cb"]

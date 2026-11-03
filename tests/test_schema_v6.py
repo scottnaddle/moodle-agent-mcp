@@ -68,7 +68,7 @@ def test_v5_to_v6_keeps_rows_and_fills_host_key(tmp_path):
     assert registry.get("local").host_key is None  # not a public https host
     assert registry.get_by_host_key("moodle.example").site_id == "demo"
     with sqlite3.connect(db) as conn:
-        assert conn.execute("SELECT schema_version FROM meta").fetchone()[0] == 6
+        assert conn.execute("SELECT schema_version FROM meta").fetchone()[0] == 7  # v7 (operator link) follows v6
         assert conn.execute("SELECT COUNT(*) FROM oauth_grants").fetchone()[0] == 1
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         assert {"site_credentials", "site_registrations"} <= tables and "tenants_v6" not in tables

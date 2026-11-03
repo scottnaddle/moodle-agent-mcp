@@ -22,7 +22,11 @@ summary of what the hub implements.
    confirm). Teacher grants are kept only when `site_identifier_hash` equals the recorded one
    (same Moodle); otherwise every grant and its hub tokens are revoked. The `200` response carries
    `grants_kept: true|false`. A host that belongs to an operator-created tenant → `409
-   site_managed_by_operator`; the operator links it by hand, nothing is absorbed automatically.
+   site_managed_by_operator`; nothing is absorbed automatically. The operator may link it by hand
+   (`moodle-hub-admin link-host`, [OPERATOR-LINK.md](OPERATOR-LINK.md)): a linked host's
+   registration (callback still verified) reuses the operator tenant (`200`, `site_key` = its
+   site_id) and gets a shared secret for `/m/<host_key>` only; `/t/`, the site token, the static
+   bearer and `oauth.secret` are untouched.
 5. The response carries `site_secret` once (`201` new, `200` re-registration). The plugin stores it
    encrypted and calls `POST /api/v1/sites/{site_key}/confirm` with it as Bearer → `current`.
    `rotate` (Bearer = current secret) issues a new pending secret; `status` reports.
@@ -42,11 +46,17 @@ info="oauth-mac|<site_key>|v<n>")` sealed with the KEK (OAuth message signing, c
 | `/m/<host_key>/mcp`, `/m/<host_key>/oauth/*`, `/.well-known/…/m/<host_key>` | `UBIONAI_HUB_HOST_ROUTES=1`, else 404. OAuth only |
 | `/t/<site_key>/mcp` | legacy family; self-registered tenants use OAuth here too (`UBIONAI_HUB_LEGACY_TENANT_ROUTES=0` hides them) |
 
-For a host that is not registered (or pending/disabled, or not yet confirmed), `/m/` answers
+For a host that **no tenant** holds (neither self-registered nor an operator tenant with that
+host_key), every `/m/<host_key>/…` and `/.well-known/…/m/<host_key>…` path answers
+`404 {"error":"not found"}` (canonical or not), except a browser `GET …/oauth/authorize`, which gets
+the static "ask your Moodle administrator" page — also `404` (escaped host only, strict CSP,
+no-store, KO/EN, 60/min per IP). Nothing is fetched or stored for such hosts.
+
+For a known host that is pending/disabled or not yet confirmed (no signer), `/m/` answers
 statically: `401` + `resource_metadata`, PRM/AS metadata, stateless DCR (`dcr_s1.` client ids,
-MACed with a KEK-derived key, nothing stored) and an "ask your Moodle administrator" page on
-`/oauth/authorize` (escaped host only, strict CSP, no-store, KO/EN, 60/min per IP). Non-canonical
-URLs get `400 non_canonical_url` with `canonical_url`.
+MACed with a KEK-derived key, nothing stored) and the pending/disabled page on `/oauth/authorize`.
+Non-canonical URLs of a known host get `400 non_canonical_url` with `canonical_url`. Clients
+therefore add the connector after the site has registered (earlier, the URL is a 404).
 
 ## Decisions of 2026-11-03 (Scott, contract §8.3)
 
@@ -55,8 +65,31 @@ URLs get `400 non_canonical_url` with `canonical_url`.
 | 1 | New sites active at once, lowest tier (`limited`). Operator switches: `UBIONAI_HUB_REG_AUTO_ACTIVATE=0` (new sites `pending`), `moodle-hub-admin disable --site-id <key>` or `--host <host_key>` per site (re-registration cannot re-enable: `403 host_blocked`) | `registration.py`, `admin.py` |
 | 2 | Provisional limits from configuration: 5 teachers, 200 requests/day | `limits.py`, `oauth.py`, `server.py` |
 | 3 | Re-registration keeps grants only for the same site (`site_identifier_hash`), else revokes all | `registration.py`, `Registry.revoke_grants` |
-| 4 | Host collision with an operator tenant → `409`; linking is manual | `registration.py` |
+| 4 | Host collision with an operator tenant → `409`; linking is manual: `moodle-hub-admin link-host --site <id> --url <wwwroot>` / `unlink-host --site <id>` ([OPERATOR-LINK.md](OPERATOR-LINK.md)) | `registration.py`, `admin.py`, `Registry.link_host` |
 | 5 | HKDF / hash design unchanged; tests assert that `site_secret`, `mac_key` and tokens never reach logs | `tests/test_reg_decisions.py` |
+
+## Operator link (decision #4)
+
+```sh
+moodle-hub-admin link-host   --site school-op --url https://lms.school.ac.kr/moodle
+moodle-hub-admin unlink-host --site school-op
+moodle-hub-admin list --json   # "linked": true|false
+```
+
+- `link-host`: operator tenants only; the host_key (same normalisation as registration) must not
+  belong to another tenant, and a tenant already routed under a different host_key is refused.
+  Idempotent. Warns when `--url` differs from the tenant's `moodle_url` (OAuth still redirects to
+  `moodle_url`).
+- Linked + `UBIONAI_HUB_HOST_ROUTES=1` → registration `200` with `tier=standard`,
+  `legacy_mcp_url: null`, `oauth.issuers` = `/m/<host_key>` only. Not linked, or host routes off →
+  `409 site_managed_by_operator`. Disabled → `403 host_blocked`. More than 3 registrations in 24 h →
+  `429` (the operator tenant's status is never changed).
+- `grants_kept`: true on the first linked registration and for the same `site_identifier_hash`;
+  a different Moodle revokes `/m/` grants only.
+- `unlink-host`: deletes the shared-secret credentials, revokes `/m/` grants (hub side; Moodle user
+  tokens are not contacted), keeps `host_key`; registration is `409` again.
+- Every link/unlink → `operator_link_audit` row (site_id, host_key, action, OS user, time) + a
+  WARNING log line. No secrets. Schema v7 (`tenants.link_approved_at`), applied idempotently at open.
 
 ## Limits (`tier=limited`)
 

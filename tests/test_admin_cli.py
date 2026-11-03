@@ -78,6 +78,7 @@ def test_add_list_rotate_disable_enable_delete(admin_env, capsys):
             "origin": "operator",
             "tier": "standard",
             "host_key": "a.test",
+            "linked": False,
             "has_litellm": True,
             "kek_id": load_kek(kek_file).kek_id,
             "pseudonymize": True,
