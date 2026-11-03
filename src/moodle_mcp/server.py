@@ -1910,6 +1910,16 @@ class TenantRouterMiddleware:
         except HostKeyError:
             await _json(send, 404, {"error": "unsupported_host"})
             return
+        tenant = self.registry.get_by_host_key(canonical)
+        if tenant is None:
+            # No tenant (self-registered or operator) has this host: no OAuth face for arbitrary
+            # hosts (docs/OPERATOR-LINK.md). A browser on authorize still gets the static, escaped
+            # "ask your administrator" page, which is a 404 too. Known hosts: 200 / 401 / pages below.
+            if route.kind == "oauth" and route.endpoint == "authorize" and scope.get("method") == "GET":
+                await self.oauth.serve_host_route(scope, receive, send, route.kind, route.endpoint, canonical, None)
+                return
+            await _json(send, 404, {"error": "not found"}, [(b"cache-control", b"no-store")])
+            return
         raw_path = scope.get("raw_path")
         raw_ok = not raw_path or raw_path.decode("latin-1") == path
         if canonical != route.raw_host_key or not raw_ok:
@@ -1922,17 +1932,16 @@ class TenantRouterMiddleware:
             await _json(send, 400, {"error": "non_canonical_url", "canonical_url": canonical_url},
                         [(b"cache-control", b"no-store")])
             return
-        tenant = self.registry.get_by_host_key(canonical)
         if route.kind != "mcp":
             await self.oauth.serve_host_route(scope, receive, send, route.kind, route.endpoint, canonical, tenant)
             return
-        ref = TenantRef.host(tenant.site_id if tenant is not None else "", canonical)
+        ref = TenantRef.host(tenant.site_id, canonical)
         bearer = _bearer_from_scope(scope)
         if bearer is None:
             await _json(send, 401, {"error": "unauthorized"}, [(b"www-authenticate", self.oauth.challenge(ref))])
             return
         grant = self.oauth.authenticate(ref, bearer) if self.oauth.host_ready(tenant) else None
-        if grant is None or tenant is None:
+        if grant is None:
             await _json(
                 send, 401, {"error": "invalid_token"},
                 [(b"www-authenticate", self.oauth.challenge(ref, "invalid_token"))],

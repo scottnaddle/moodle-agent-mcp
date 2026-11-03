@@ -13,7 +13,8 @@ import sys
 from datetime import datetime, timezone
 
 from .crypto import KekError, load_kek
-from .registry import ASSIGNMENT_TITLE_HEURISTICS, Registry, TenantError
+from .hostkey import HostKeyError, allowed_ports_from_env, normalize_site_url
+from .registry import ASSIGNMENT_TITLE_HEURISTICS, Registry, TenantError, operator_host_key
 
 
 def _read_secret(path: str) -> bytes:
@@ -109,6 +110,15 @@ def build_parser() -> argparse.ArgumentParser:
     enable_target.add_argument("--site-id")
     enable_target.add_argument("--host")
 
+    # Decision #4 (docs/OPERATOR-LINK.md): an operator tenant's host may self-register only after
+    # the operator links it here; /t/ and the legacy credentials are never touched.
+    link = sub.add_parser("link-host", help="allow self-registration of an operator tenant's host")
+    link.add_argument("--site", "--site-id", dest="site_id", required=True)
+    link.add_argument("--url", required=True, help="the site's wwwroot, e.g. https://lms.example.ac.kr/moodle")
+
+    unlink = sub.add_parser("unlink-host", help="withdraw link-host (site secret deleted, /m/ grants revoked)")
+    unlink.add_argument("--site", "--site-id", dest="site_id", required=True)
+
     listing = sub.add_parser("list", help="list tenants (metadata only)")
     listing.add_argument("--json", action="store_true")
 
@@ -136,6 +146,7 @@ def _metadata(tenant) -> dict[str, object]:
         "origin": tenant.origin,
         "tier": tenant.tier,
         "host_key": tenant.host_key,
+        "linked": tenant.operator_linked,
         "has_litellm": tenant.litellm_ct is not None,
         "kek_id": tenant.kek_id,
         "pseudonymize": tenant.pseudonymize,
@@ -143,6 +154,17 @@ def _metadata(tenant) -> dict[str, object]:
         "created_at": tenant.created_at,
         "updated_at": tenant.updated_at,
     }
+
+
+def _actor() -> str:
+    try:
+        return getpass.getuser()
+    except Exception:  # noqa: BLE001 - no user database (container); the audit row still lands
+        return "unknown"
+
+
+def _stamp(epoch: int | None) -> str:
+    return datetime.fromtimestamp(epoch, timezone.utc).isoformat() if epoch is not None else "-"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -220,6 +242,27 @@ def main(argv: list[str] | None = None) -> int:
             status = "disabled" if args.command == "disable" else "active"
             registry.set_status(site_id, status)
             print(f"{args.command}d site={site_id}")
+            return 0
+
+        if args.command == "link-host":
+            try:
+                host_key = normalize_site_url(args.url, allowed_ports_from_env()).host_key
+            except HostKeyError as exc:
+                print(f"error: invalid --url ({exc.code}: {exc})", file=sys.stderr)
+                return 1
+            current = registry.get(args.site_id)
+            if current is not None and operator_host_key(current.moodle_url) not in (None, host_key):
+                print(f"warning: --url host_key {host_key} differs from the tenant's moodle_url"
+                      f" {current.moodle_url}; OAuth still redirects to moodle_url", file=sys.stderr)
+            tenant, changed = registry.link_host(args.site_id, host_key, actor=_actor())
+            state = "linked" if changed else "already linked"
+            print(f"{state} site={tenant.site_id} host_key={host_key}"
+                  f" mcp_url=/m/{host_key}/mcp at={_stamp(tenant.link_approved_at)}")
+            return 0
+
+        if args.command == "unlink-host":
+            tenant, revoked = registry.unlink_host(args.site_id, actor=_actor())
+            print(f"unlinked site={tenant.site_id} host_key={tenant.host_key} revoked_m_grants={revoked}")
             return 0
 
         if args.command == "list":

@@ -564,8 +564,20 @@ class OAuthServer:
             return None
         return load_tenant_secret(self.secrets_dir, site)
 
-    def authenticator(self, tenant: Tenant) -> SiteAuthenticator | None:
-        """Message signer chosen by the tenant's auth_mode (contract §7.1)."""
+    def authenticator(self, tenant: Tenant, ref: TenantRef | None = None) -> SiteAuthenticator | None:
+        """Message signer chosen by the tenant's auth_mode (contract §7.1).
+
+        A linked operator tenant (docs/OPERATOR-LINK.md) signs ``/m/<host_key>`` messages with its
+        confirmed shared-secret credential; ``/t/`` (and ``/m/`` before the first confirm) keeps the
+        legacy file secret.
+        """
+        if (
+            tenant.operator_linked and ref is not None and ref.host_key is not None
+            and ref.host_key == tenant.host_key
+        ):
+            linked = self.credentials.authenticator(tenant.site_id, tenant.moodle_url)
+            if linked is not None:
+                return linked
         if tenant.auth_mode == "legacy_file":
             secret = self.secret(tenant.site_id)
             return FileSecretAuthenticator(secret) if secret is not None else None
@@ -576,18 +588,18 @@ class OAuthServer:
     def transport_for(self, tenant: Tenant) -> httpx.AsyncBaseTransport | None:
         return self.pinned_transport if tenant.self_registered else self.transport
 
-    def tenant(self, site: str) -> tuple[Tenant, SiteAuthenticator] | None:
+    def tenant(self, site: str, ref: TenantRef | None = None) -> tuple[Tenant, SiteAuthenticator] | None:
         """Active tenant with a usable message signer, else None (OAuth off for that site)."""
         if not SITE_ID_RE.fullmatch(site):
             return None
         tenant = self.registry.get(site)
         if tenant is None or tenant.status != "active":
             return None
-        auth = self.authenticator(tenant)
+        auth = self.authenticator(tenant, ref)
         return (tenant, auth) if auth is not None else None
 
-    def enabled(self, site: str) -> bool:
-        return self.tenant(site) is not None
+    def enabled(self, site: str, ref: TenantRef | None = None) -> bool:
+        return self.tenant(site, ref) is not None
 
     def challenge(self, ref: TenantRef | str, error: str | None = None) -> bytes:
         value = f'Bearer resource_metadata="{self.prm_url(ref)}", scope="{" ".join(SCOPES)}"'
@@ -601,7 +613,7 @@ class OAuthServer:
 
     def _found(self, request: Request) -> tuple[TenantRef, Tenant, SiteAuthenticator] | None:
         ref = self._ref(request)
-        found = self.tenant(ref.site_id)
+        found = self.tenant(ref.site_id, ref)
         if found is None:
             return None
         if ref.host_key is None and found[0].self_registered and not self.legacy_self_registered:
@@ -611,9 +623,17 @@ class OAuthServer:
         return ref, found[0], found[1]
 
     def _ref_for_grant(self, grant: Grant) -> TenantRef:
-        base = grant.resource[len(self.public_url):] if grant.resource.startswith(self.public_url) else ""
+        return self._ref_for_resource(grant.site_id, grant.resource)
+
+    def _ref_for_resource(self, site: str, resource: str) -> TenantRef:
+        base = resource[len(self.public_url):] if resource.startswith(self.public_url) else ""
         base = base[: -len("/mcp")] if base.endswith("/mcp") else ""
-        return TenantRef(grant.site_id, base) if base else TenantRef.legacy(grant.site_id)
+        return TenantRef(site, base) if base else TenantRef.legacy(site)
+
+    def _revoke_code(self, code: PendingCode) -> None:
+        """Burn an unredeemed code's Moodle token, signed for the URL family it was issued on."""
+        ref = self._ref_for_resource(code.site, code.resource)
+        self._spawn(self._revoke_moodle(code.site, code.moodle_userid, code.moodle_tokenid, ref))
 
     # --- RS -------------------------------------------------------------------------------
     def authenticate(self, ref: TenantRef | str, bearer: str) -> Grant | None:
@@ -673,7 +693,9 @@ class OAuthServer:
 
     def host_ready(self, tenant: Tenant | None) -> bool:
         """The tenant behind /m/<host_key> can run OAuth (active + message signer)."""
-        return tenant is not None and tenant.host_key is not None and self.enabled(tenant.site_id)
+        return tenant is not None and tenant.host_key is not None and self.enabled(
+            tenant.site_id, TenantRef.host(tenant.site_id, tenant.host_key)
+        )
 
     async def serve_host_route(
         self, scope: Scope, receive: Receive, send: Send, kind: str, endpoint: str, host_key: str, tenant: Tenant | None
@@ -944,7 +966,7 @@ class OAuthServer:
             del self.requests[key]
         for key in [k for k, c in self.codes.items() if c.exp < now]:
             code = self.codes.pop(key)
-            self._spawn(self._revoke_moodle(code.site, code.moodle_userid, code.moodle_tokenid))
+            self._revoke_code(code)
 
     def _spawn(self, coro: Awaitable[Any]) -> None:
         try:
@@ -1164,7 +1186,7 @@ class OAuthServer:
         return None
 
     async def _revoke_moodle(self, site: str, userid: int, tokenid: int, ref: TenantRef | None = None) -> bool:
-        found = self.tenant(site)
+        found = self.tenant(site, ref)
         if not found:
             return False
         tenant, auth = found
@@ -1255,7 +1277,7 @@ class OAuthServer:
                 or code.resource != self.resource(ref)
             ):
                 if code is not None:
-                    self._spawn(self._revoke_moodle(code.site, code.moodle_userid, code.moodle_tokenid))
+                    self._revoke_code(code)
                 return _oauth_error("invalid_grant", "invalid code")
             verifier = str(form.get("code_verifier") or "")
             if (
@@ -1264,12 +1286,12 @@ class OAuthServer:
                 or not hmac.compare_digest(_b64(hashlib.sha256(verifier.encode()).digest()), code.code_challenge)
             ):
                 # The code is burnt either way; its Moodle token must not linger.
-                self._spawn(self._revoke_moodle(code.site, code.moodle_userid, code.moodle_tokenid))
+                self._revoke_code(code)
                 return _oauth_error("invalid_grant", "redirect_uri or PKCE verification failed")
             tenant = self.registry.get(site)
             if tenant is not None and self.teacher_limit_reached(tenant, code.moodle_userid):
                 # Another new teacher got the last seat between callback and token.
-                self._spawn(self._revoke_moodle(code.site, code.moodle_userid, code.moodle_tokenid))
+                self._revoke_code(code)
                 return _oauth_error("invalid_grant", TEACHER_LIMIT_ERROR)
             with self.registry._connect() as conn:
                 conn.execute(

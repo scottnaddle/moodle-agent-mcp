@@ -470,14 +470,18 @@ class RegistrationAPI:
             return None
         return f"{self.public_url}/m/{tenant.host_key}/mcp"
 
-    def legacy_mcp_url(self, tenant: Tenant) -> str:
+    def legacy_mcp_url(self, tenant: Tenant) -> str | None:
+        # A linked operator tenant keeps /t/ on its legacy file secret: the site secret is /m/ only.
+        if tenant.operator_linked:
+            return None
         return f"{self.public_url}/t/{tenant.site_id}/mcp"
 
     def issuers(self, tenant: Tenant) -> list[str]:
         out = []
         if self.config.host_routes and tenant.host_key is not None:
             out.append(f"{self.public_url}/m/{tenant.host_key}")
-        out.append(f"{self.public_url}/t/{tenant.site_id}")
+        if not tenant.operator_linked:
+            out.append(f"{self.public_url}/t/{tenant.site_id}")
         return out
 
     def hub_metadata(self) -> dict[str, Any]:
@@ -619,7 +623,7 @@ class RegistrationAPI:
     def _reregistrations_since(self, host_key: str, since: int) -> int:
         with self.registry._connect() as conn:
             return conn.execute(
-                "SELECT COUNT(*) FROM site_registrations WHERE host_key = ? AND outcome = 'reregistered'"
+                "SELECT COUNT(*) FROM site_registrations WHERE host_key = ? AND outcome IN ('reregistered', 'linked')"
                 " AND created_at >= ?",
                 (host_key, since),
             ).fetchone()[0]
@@ -705,13 +709,17 @@ class RegistrationAPI:
         contact = json.dumps(req.contact).encode() if req.contact else None
         tenant = self.registry.get_by_host_key(host_key)
         if tenant is not None and not tenant.self_registered:
-            # Decided 2026-11-03 (§8.3 #5): never absorbed automatically; the operator links it by hand.
-            logger.warning("self-registration: %s collides with operator tenant site=%s; refused (409)",
-                           host_key, tenant.site_id)
-            raise ApiError(409, "site_managed_by_operator",
-                           "this site is managed by the hub operator; contact the operator to link it")
+            # Decided 2026-11-03 (§8.3 #4): never absorbed automatically; the operator links it by
+            # hand (moodle-hub-admin link-host, docs/OPERATOR-LINK.md). Only /m/ can use the link.
+            if not tenant.operator_linked or not self.config.host_routes:
+                logger.warning("self-registration: %s collides with operator tenant site=%s; refused (409)",
+                               host_key, tenant.site_id)
+                raise ApiError(409, "site_managed_by_operator",
+                               "this site is managed by the hub operator; contact the operator to link it")
         if tenant is not None and tenant.status == "disabled":
             raise ApiError(403, "host_blocked", "this site cannot be registered; contact the hub operator")
+        if tenant is not None and tenant.operator_linked:
+            return self._register_linked(req, tenant, now, contact)
         if tenant is None:
             status = "active" if self.config.auto_activate else "pending"
             if self.registry.count_self_registered_since(now - DAY) >= self.config.daily_new_tenants:
@@ -761,13 +769,49 @@ class RegistrationAPI:
         payload["grants_kept"] = same_site
         return 200, payload, tenant.site_id, "reregistered"
 
+    def _register_linked(
+        self, req: RegistrationRequest, tenant: Tenant, now: int, contact: bytes | None
+    ) -> tuple[int, dict[str, Any], str, str]:
+        """Registration of a host the operator linked to its tenant (docs/OPERATOR-LINK.md).
+
+        Same tenant (site_key = operator site_id), a new pending shared secret for /m/. The
+        operator's token, bearer, oauth.secret, status and /t/ grants are left alone.
+        """
+        assert tenant.host_key is not None
+        if self._reregistrations_since(tenant.host_key, now - DAY) >= 3:
+            # Unlike self-registered sites the status is not touched: /t/ keeps serving.
+            logger.warning("self-registration: linked %s registered more than 3 times in 24h; refused",
+                           tenant.host_key)
+            raise ApiError(429, "rate_limited", "too many re-registrations; try again later", DAY)
+        # No identity recorded yet: the operator vouched for the host. A different Moodle later
+        # loses the /m/ grants only.
+        same_site = tenant.site_identifier_hash is None or hmac.compare_digest(
+            tenant.site_identifier_hash, req.site_identifier_hash
+        )
+        if not same_site:
+            revoked = self.registry.revoke_host_grants(tenant.site_id, tenant.host_key)
+            logger.warning("self-registration: linked site=%s registered as a different Moodle site;"
+                           " revoked %d /m/ grant(s)", tenant.site_id, revoked)
+        self.registry.record_verification(
+            tenant.site_id, plugin_version=req.plugin_version, moodle_release=req.moodle_release,
+            site_identifier_hash=req.site_identifier_hash, consent_version=req.terms_version,
+            consent_at=req.consent_at, contact=contact,
+        )
+        tenant = self.registry.get(tenant.site_id) or tenant
+        issued = self.store.issue(tenant.site_id)
+        logger.info("self-registration: linked operator site=%s host=%s version=%s grants_kept=%s",
+                    tenant.site_id, tenant.host_key, issued.version, same_site)
+        payload = self.issued_payload(tenant, issued)
+        payload["grants_kept"] = same_site
+        return 200, payload, tenant.site_id, "linked"
+
     # --- confirm / rotate / status --------------------------------------------------------
     def site_action(self, scope: Any, site_key: str, action: str, body: Any) -> tuple[int, dict[str, Any]]:
         wait = self.limiter.hit(Rule(f"site:{site_key}", 30, HOUR))
         if wait is not None:
             raise ApiError(429, "rate_limited", "too many requests for this site", wait)
         tenant = self.registry.get(site_key)
-        if tenant is None or not tenant.self_registered:
+        if tenant is None or not tenant.uses_site_secret:
             raise ApiError(404, "site_not_found", "unknown site_key; register again")
         presented = _bearer(self._headers(scope).get(b"authorization"))
         if presented is None:
