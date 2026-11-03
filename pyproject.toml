@@ -15,6 +15,7 @@ dependencies = [
     "starlette>=0.40",
     "pydantic>=2.7,<3",
     "cryptography>=43,<46",
+    "idna>=3.7,<4",  # UTS #46 + IDNA 2008 host_key normalisation (already an httpx dependency)
 ]
 
 [project.optional-dependencies]
