@@ -88,9 +88,18 @@ not enforced yet). Operator tenants (`tier=standard`) are not limited.
 | `UBIONAI_HUB_REG_MIN_TERMS_VERSION` | `2026-11-01` |
 | `UBIONAI_HUB_TRUSTED_PROXIES` | empty (only then is `X-Forwarded-For` used for rate limits) |
 | `UBIONAI_HUB_PUBLIC_KEYS_FILE` | empty |
+| `UBIONAI_HUB_SELF_ADDRESSES` | empty (hub origin IPs, comma-separated; when set, only these + `UBIONAI_HUB_EGRESS_IP` are blocked as "self" and the public URL is not resolved) |
+| `UBIONAI_HUB_SELF_VET_DNS` | `1` (`0` → do not resolve the public URL for self-vetting) |
 
 `UBIONAI_HUB_PUBLIC_URL` is required when self-registration or host routes are on.
 Rate limits are in-process (single uvicorn worker assumed).
+
+Self-vetting: by default the hub resolves the host of `UBIONAI_HUB_PUBLIC_URL` and refuses
+callbacks to those addresses (and to `UBIONAI_HUB_EGRESS_IP`). Behind a CDN/proxy (e.g. Cloudflare)
+that host resolves to shared anycast IPs, which would refuse every Moodle site behind the same CDN
+with `403 private_address_not_supported`. There, set `UBIONAI_HUB_SELF_ADDRESSES` to the real
+origin IPs (or `UBIONAI_HUB_SELF_VET_DNS=0` if egress IPs cover it). Refusals caused by a self
+address are logged as `reason=self_address` (others `reason=non_public`).
 
 ## Security notes
 
