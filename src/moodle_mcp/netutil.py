@@ -148,6 +148,9 @@ class AddressPolicy:
     extra_deny: tuple[IPNetwork, ...] = ()
     self_addresses: set[IPAddress] = field(default_factory=set)
 
+    def is_self(self, ip: IPAddress) -> bool:
+        return any(candidate in self.self_addresses for candidate in _embedded(ip))
+
     def allowed(self, ip: IPAddress) -> bool:
         if not ip_allowed(ip):
             return False
@@ -170,7 +173,11 @@ class ResolveError(Exception):
 
 
 class BlockedAddress(Exception):
-    """The host is (or resolves to) a non-public address."""
+    """The host is (or resolves to) a non-public address. ``reason``: non_public or self_address."""
+
+    def __init__(self, message: str, reason: str = "non_public") -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 async def vet_host(
@@ -200,12 +207,16 @@ async def vet_host(
         raise ResolveError("resolver returned a malformed address") from exc
     check = policy.allowed if policy is not None else ip_allowed
     if not all(check(ip) for ip in ips):
+        if policy is not None and any(policy.is_self(ip) for ip in ips):
+            raise BlockedAddress("host resolves to a hub self address", "self_address")
         raise BlockedAddress("host resolves to a non-public address")
     return str(ips[0])
 
 
 class BlockedAddressError(httpx.TransportError):
     """Raised by PinnedPublicTransport when the destination is not a public address."""
+
+    reason = "non_public"
 
 
 class PinnedPublicTransport(httpx.AsyncBaseTransport):
@@ -242,7 +253,9 @@ class PinnedPublicTransport(httpx.AsyncBaseTransport):
         try:
             ip = await vet_host(host, port, self.resolve, self.policy, allow_literal=self.allow_literal)
         except BlockedAddress as exc:
-            raise BlockedAddressError(str(exc), request=request) from None
+            error = BlockedAddressError(str(exc), request=request)
+            error.reason = exc.reason
+            raise error from None
         except ResolveError as exc:
             raise httpx.ConnectError(str(exc), request=request) from None
         self.targets.append((host, ip))
@@ -263,10 +276,11 @@ class PinnedPublicTransport(httpx.AsyncBaseTransport):
 class FetchError(Exception):
     """A pinned fetch failed. ``kind``: blocked, unreachable, redirected, status, too_large, timeout."""
 
-    def __init__(self, kind: str, detail: str = "", status: int | None = None) -> None:
+    def __init__(self, kind: str, detail: str = "", status: int | None = None, reason: str | None = None) -> None:
         super().__init__(f"{kind}: {detail}" if detail else kind)
         self.kind = kind
         self.status = status
+        self.reason = reason
 
 
 @dataclass
@@ -318,7 +332,7 @@ class SafeFetcher:
         except FetchError:
             raise
         except BlockedAddressError as exc:
-            raise FetchError("blocked", str(exc)) from None
+            raise FetchError("blocked", str(exc), reason=exc.reason) from None
         except (TimeoutError, httpx.TimeoutException):
             raise FetchError("timeout") from None
         except (httpx.HTTPError, OSError) as exc:

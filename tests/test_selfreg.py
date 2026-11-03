@@ -267,6 +267,56 @@ async def test_callback_points_at_the_hub_itself(make_hub):
     assert_error(await register(hub), 403, "private_address_not_supported")
 
 
+# Hub and Moodle site behind the same CDN: the public URL resolves to shared anycast addresses.
+CDN = ["104.21.10.20", "2606:4700::6810:a14"]
+
+
+async def test_cdn_shared_addresses_blocked_by_default(make_hub, caplog):
+    hub = make_hub(dns=FakeDNS({HOST: CDN, "hub.example": CDN}))
+    with caplog.at_level("INFO", logger="moodle_mcp.registration"):
+        assert_error(await register(hub), 403, "private_address_not_supported")
+    assert "reason=self_address" in caplog.text
+    assert hub.site.callback_hits == 0
+
+
+async def test_cdn_shared_addresses_with_self_addresses(make_hub):
+    dns = FakeDNS({HOST: CDN, "hub.example": CDN})
+    hub = make_hub(FakeSite(ip=CDN[0]), dns, UBIONAI_HUB_SELF_ADDRESSES="5.6.7.10, 2001:db9::10")
+    resp = await register(hub)
+    assert resp.status_code in (200, 201), resp.text
+    assert "hub.example" not in dns.calls  # no DNS-based self-vet
+
+
+async def test_self_vet_dns_off(make_hub):
+    dns = FakeDNS({HOST: CDN, "hub.example": CDN})
+    hub = make_hub(FakeSite(ip=CDN[0]), dns, UBIONAI_HUB_SELF_VET_DNS="0")
+    resp = await register(hub)
+    assert resp.status_code in (200, 201), resp.text
+    assert "hub.example" not in dns.calls
+
+
+async def test_self_addresses_still_blocks_origin_and_egress(make_hub, caplog):
+    env = {"UBIONAI_HUB_SELF_ADDRESSES": "5.6.7.10"}
+    hub = make_hub(dns=FakeDNS({HOST: ["5.6.7.10"], "hub.example": CDN}), **env)
+    with caplog.at_level("INFO", logger="moodle_mcp.registration"):
+        assert_error(await register(hub), 403, "private_address_not_supported")
+    assert "reason=self_address" in caplog.text
+    hub = make_hub(dns=FakeDNS({HOST: ["::ffff:5.6.7.10"], "hub.example": CDN}), **env)
+    assert_error(await register(hub), 403, "private_address_not_supported")
+    hub = make_hub(dns=FakeDNS({HOST: ["5.6.7.9"], "hub.example": CDN}), **env)  # egress IP
+    assert_error(await register(hub), 403, "private_address_not_supported")
+    hub = make_hub(dns=FakeDNS({HOST: ["1.2.3.4", "10.1.1.1"], "hub.example": CDN}), **env)
+    caplog.clear()
+    with caplog.at_level("INFO", logger="moodle_mcp.registration"):
+        assert_error(await register(hub), 403, "private_address_not_supported")
+    assert "reason=non_public" in caplog.text
+
+
+def test_self_addresses_invalid_refuses_start(make_hub):
+    with pytest.raises(RuntimeError, match="UBIONAI_HUB_SELF_ADDRESSES"):
+        make_hub(UBIONAI_HUB_SELF_ADDRESSES="10.0.0.0/8")
+
+
 def _cb(site, **changes):
     def handler(request):
         nonce = request.url.params["nonce"]

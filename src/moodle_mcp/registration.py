@@ -37,6 +37,7 @@ from .hostkey import (
 from .netutil import (
     AddressPolicy,
     FetchError,
+    IPAddress,
     IPNetwork,
     SafeFetcher,
     client_ip_key,
@@ -101,6 +102,10 @@ class RegistrationConfig:
     min_plugin_version: int = 2026110300
     min_terms_version: str = "2026-11-01"
     trusted_proxies: tuple[IPNetwork, ...] = ()
+    # The hub's real origin addresses. Set behind a CDN: the public URL then resolves to shared
+    # anycast IPs, and blocking those would refuse every site behind the same CDN.
+    self_addresses: tuple[IPAddress, ...] = ()
+    self_vet_dns: bool = True
     daily_new_tenants: int = 200
     public_keys: tuple[dict[str, Any], ...] = ()
     limits: TierLimits = TierLimits()
@@ -124,6 +129,13 @@ class RegistrationConfig:
                     blocked.add(normalize_host_key(entry.strip(), frozenset(range(1, 65536))))
                 except HostKeyError:
                     raise ValueError(f"UBIONAI_HUB_REG_BLOCKED_HOSTS: invalid entry '{entry.strip()}'") from None
+        self_addresses: list[IPAddress] = []
+        for entry in (os.environ.get("UBIONAI_HUB_SELF_ADDRESSES") or "").split(","):
+            if entry.strip():
+                try:
+                    self_addresses.append(ipaddress.ip_address(entry.strip().strip("[]")))
+                except ValueError:
+                    raise ValueError(f"UBIONAI_HUB_SELF_ADDRESSES: invalid IP '{entry.strip()}'") from None
         return cls(
             enabled=_flag("UBIONAI_HUB_SELF_REGISTRATION", "0"),
             host_routes=_flag("UBIONAI_HUB_HOST_ROUTES", "0"),
@@ -135,6 +147,8 @@ class RegistrationConfig:
             min_plugin_version=int(min_plugin),
             min_terms_version=terms,
             trusted_proxies=parse_networks(os.environ.get("UBIONAI_HUB_TRUSTED_PROXIES")),
+            self_addresses=tuple(self_addresses),
+            self_vet_dns=(os.environ.get("UBIONAI_HUB_SELF_VET_DNS") or "1").strip() != "0",  # only "0" disables
             public_keys=load_public_keys(os.environ.get("UBIONAI_HUB_PUBLIC_KEYS_FILE")),
             limits=TierLimits.from_env(),
         )
@@ -335,6 +349,7 @@ class RegistrationAPI:
                 policy.self_addresses.add(ipaddress.ip_address(ip.split("/", 1)[0]))
             except ValueError:
                 pass
+        policy.self_addresses.update(self.config.self_addresses)
         if self.fetcher is None:
             self.fetcher = SafeFetcher(policy=policy)
         else:
@@ -556,10 +571,16 @@ class RegistrationAPI:
             raise ApiError(429, "rate_limited", "too many registration attempts", wait)
 
     async def _vet_self(self) -> None:
-        """Refuse callbacks to the hub itself (resolved lazily, once, with the fetcher's resolver)."""
+        """Refuse callbacks to the hub itself (resolved lazily, once, with the fetcher's resolver).
+
+        Skipped when the operator lists the origin addresses (UBIONAI_HUB_SELF_ADDRESSES) or turns
+        it off (UBIONAI_HUB_SELF_VET_DNS=0): behind a CDN the public URL resolves to shared IPs.
+        """
         if self._self_vetted:
             return
         self._self_vetted = True
+        if self.config.self_addresses or not self.config.self_vet_dns:
+            return
         assert self.fetcher is not None
         host = urlsplit(self.public_url).hostname
         if not host:
@@ -609,7 +630,10 @@ class RegistrationAPI:
         try:
             doc = await self.fetcher.get_json(url)
         except FetchError as exc:
-            logger.info("registration callback failed url_host=%s: %s", urlsplit(site_url).hostname, exc)
+            logger.info(
+                "registration callback failed url_host=%s reason=%s: %s",
+                urlsplit(site_url).hostname, exc.reason or exc.kind, exc,
+            )
             if exc.kind == "status":
                 if exc.status == 404:
                     raise ApiError(422, "callback_mismatch", "the callback did not recognise this request") from None
