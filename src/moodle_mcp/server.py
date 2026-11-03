@@ -35,6 +35,7 @@ from .crypto import (
 )
 from .moodle import MoodleClient, MoodleError
 from .hostkey import HostKeyError, HostRoute, is_host_route, normalize_host_key, parse_host_route
+from .limits import DailyUsage, TierLimits
 from .netutil import (
     AddressPolicy,
     PinnedPublicTransport,
@@ -1783,8 +1784,12 @@ class TenantRouterMiddleware:
         host_routes: bool = False,
         legacy_self_registered: bool = True,
         allowed_ports: frozenset[int] = frozenset({443}),
+        limits: TierLimits | None = None,
+        usage: DailyUsage | None = None,
     ) -> None:
         self.app = app
+        self.limits = limits or TierLimits()
+        self.usage = usage
         self.registry = registry
         self.pseudonymizers = pseudonymizers or _PseudonymizerStore(registry, kek)
         self.oauth = oauth
@@ -1939,6 +1944,19 @@ class TenantRouterMiddleware:
         self, scope: Scope, receive: Receive, send: Send, tenant: Tenant, grant: Grant | None
     ) -> None:
         site_id = tenant.site_id
+        if tenant.tier == "limited" and self.usage is not None:
+            # §8.3 #2: authenticated MCP requests per UTC day; §4.1 error format.
+            wait = self.usage.hit(site_id, self.limits.daily_requests)
+            if wait is not None:
+                await _json(
+                    send, 429,
+                    {"error": "daily_limit_exceeded",
+                     "error_description": f"this site's daily limit of {self.limits.daily_requests} requests"
+                                          " is used up; it resets at 00:00 UTC",
+                     "retry_after": wait},
+                    [(b"retry-after", str(wait).encode()), (b"cache-control", b"no-store")],
+                )
+                return
         token_buf: bytearray | None = None
         try:
             try:
@@ -2089,7 +2107,7 @@ def create_app(
                 registry, kek, public_url, secrets_dir, transport=moodle_transport,
                 pinned_transport=PinnedPublicTransport(moodle_transport, resolve=resolve, policy=policy),
                 legacy_self_registered=reg_config.legacy_routes,
-                page_limit=page_limit,
+                page_limit=page_limit, limits=reg_config.limits,
             )
         except OAuthConfigError as exc:
             raise RuntimeError(str(exc)) from None
@@ -2110,4 +2128,5 @@ def create_app(
         inner, registry, kek, oauth=oauth, moodle_transport=moodle_transport,
         registration=registration, host_routes=reg_config.host_routes,
         legacy_self_registered=reg_config.legacy_routes, allowed_ports=reg_config.allowed_ports,
+        limits=reg_config.limits, usage=DailyUsage(registry),
     )

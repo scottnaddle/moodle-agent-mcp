@@ -51,6 +51,7 @@ from starlette.routing import Route
 from starlette.types import Receive, Scope, Send
 
 from .crypto import PURPOSE_DCR_STATELESS, Kek, derive_key, open_, seal
+from .limits import TierLimits
 from .moodle import MoodleClient, MoodleError
 from .netutil import (
     BlockedAddress,
@@ -77,6 +78,8 @@ from .siteauth import (
 logger = logging.getLogger(__name__)
 
 SCOPES = ["moodle:read", "moodle:write"]
+# error_description when a limited-tier site already has its maximum number of teachers.
+TEACHER_LIMIT_ERROR = "teacher_limit_reached"
 ALLOWED_REDIRECTS = (
     "https://claude.ai/api/mcp/auth_callback",
     "https://claude.com/api/mcp/auth_callback",
@@ -532,6 +535,8 @@ class OAuthServer:
     legacy_self_registered: bool = True
     # Rate limit for the static "ask your administrator" page (IP -> 60/min).
     page_limit: Callable[[Request], int | None] | None = None
+    # tier=limited: at most limits.max_teachers distinct teachers with a live grant (§8.3 #2).
+    limits: TierLimits = field(default_factory=TierLimits)
     _tasks: set[asyncio.Task[Any]] = field(default_factory=set)
 
     def __post_init__(self) -> None:
@@ -632,6 +637,21 @@ class OAuthServer:
         if grant.site_id != site or grant.resource != self.resource(ref):
             return None  # RFC 8707 audience; no token passthrough across tenants or URL families
         return grant
+
+    def teacher_limit_reached(self, tenant: Tenant, userid: int) -> bool:
+        """A new teacher would exceed the tier's limit. Teachers already holding a live grant
+        (reconnecting, a second client) are always allowed."""
+        if tenant.tier != "limited":
+            return False
+        now = _now()
+        with self.registry._connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT moodle_userid FROM oauth_grants"
+                " WHERE site_id = ? AND revoked_at IS NULL AND valid_until > ?",
+                (tenant.site_id, now),
+            ).fetchall()
+        teachers = {row[0] for row in rows}
+        return userid not in teachers and len(teachers) >= self.limits.max_teachers
 
     def user_token(self, tenant: Tenant, grant: Grant) -> bytearray:
         return open_(
@@ -1098,6 +1118,11 @@ class OAuthServer:
             await self._revoke_moodle(site, userid, tokenid, ref)
             return self._to_client(req.redirect_uri, ref, req.client_state, error="access_denied",
                                    error_description=problem)
+        if self.teacher_limit_reached(tenant, userid):
+            logger.warning("teacher limit reached site=%s limit=%s", site, self.limits.max_teachers)
+            await self._revoke_moodle(site, userid, tokenid, ref)
+            return self._to_client(req.redirect_uri, ref, req.client_state, error="access_denied",
+                                   error_description=TEACHER_LIMIT_ERROR)
         grant_id = secrets.token_urlsafe(16)
         ct = seal(self.kek, data["wstoken"].encode(), site, _user_field(grant_id, userid), moodle_url=tenant.moodle_url)
         code_out = secrets.token_urlsafe(32)
@@ -1241,6 +1266,11 @@ class OAuthServer:
                 # The code is burnt either way; its Moodle token must not linger.
                 self._spawn(self._revoke_moodle(code.site, code.moodle_userid, code.moodle_tokenid))
                 return _oauth_error("invalid_grant", "redirect_uri or PKCE verification failed")
+            tenant = self.registry.get(site)
+            if tenant is not None and self.teacher_limit_reached(tenant, code.moodle_userid):
+                # Another new teacher got the last seat between callback and token.
+                self._spawn(self._revoke_moodle(code.site, code.moodle_userid, code.moodle_tokenid))
+                return _oauth_error("invalid_grant", TEACHER_LIMIT_ERROR)
             with self.registry._connect() as conn:
                 conn.execute(
                     "INSERT INTO oauth_grants (grant_id, site_id, moodle_userid, client_id, scope, resource,"

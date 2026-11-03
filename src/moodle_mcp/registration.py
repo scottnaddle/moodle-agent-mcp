@@ -25,6 +25,7 @@ from typing import Any, Callable
 from urllib.parse import quote, urlsplit
 
 from .crypto import Kek
+from .limits import TierLimits
 from .hostkey import (
     HostKeyError,
     normalize_host_key,
@@ -69,7 +70,6 @@ TOTAL_TIMEOUT = 15.0
 AUDIT_RETENTION = 90 * DAY
 VERIFIER_CONCURRENCY = 20
 IN_PROGRESS_RETRY = 15
-LIMITED_LIMITS = {"max_teachers": 5, "daily_tool_calls": 300, "concurrency": 1, "llm_proxy": False}
 
 _B64_43 = re.compile(r"[A-Za-z0-9_-]{43}")
 _HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -92,6 +92,8 @@ class RegistrationConfig:
     enabled: bool = False
     host_routes: bool = False
     legacy_routes: bool = True
+    # Decided 2026-11-03 (§8.3 #1): new sites are active at once (tier=limited). Operator switch:
+    # UBIONAI_HUB_REG_AUTO_ACTIVATE=0 creates them pending; `moodle-hub-admin disable` stops one site.
     auto_activate: bool = True
     allowed_ports: frozenset[int] = frozenset({443})
     deny_cidrs: tuple[IPNetwork, ...] = ()
@@ -101,6 +103,7 @@ class RegistrationConfig:
     trusted_proxies: tuple[IPNetwork, ...] = ()
     daily_new_tenants: int = 200
     public_keys: tuple[dict[str, Any], ...] = ()
+    limits: TierLimits = TierLimits()
 
     @classmethod
     def from_env(cls) -> "RegistrationConfig":
@@ -133,6 +136,7 @@ class RegistrationConfig:
             min_terms_version=terms,
             trusted_proxies=parse_networks(os.environ.get("UBIONAI_HUB_TRUSTED_PROXIES")),
             public_keys=load_public_keys(os.environ.get("UBIONAI_HUB_PUBLIC_KEYS_FILE")),
+            limits=TierLimits.from_env(),
         )
 
 
@@ -486,7 +490,7 @@ class RegistrationAPI:
             "secret_state": "pending_confirm",
             "confirm_url": f"{self.public_url}/api/v1/sites/{tenant.site_id}/confirm",
             "confirm_by": _rfc3339(issued.expires_at),
-            "tenant": {"status": tenant.status, "tier": tenant.tier, "limits": dict(LIMITED_LIMITS)},
+            "tenant": {"status": tenant.status, "tier": tenant.tier, "limits": self.config.limits.describe()},
             "mcp_url": self.mcp_url(tenant),
             "legacy_mcp_url": self.legacy_mcp_url(tenant),
             "oauth": {
@@ -677,7 +681,11 @@ class RegistrationAPI:
         contact = json.dumps(req.contact).encode() if req.contact else None
         tenant = self.registry.get_by_host_key(host_key)
         if tenant is not None and not tenant.self_registered:
-            raise ApiError(409, "site_managed_by_operator", "this site is managed by the hub operator")
+            # Decided 2026-11-03 (§8.3 #5): never absorbed automatically; the operator links it by hand.
+            logger.warning("self-registration: %s collides with operator tenant site=%s; refused (409)",
+                           host_key, tenant.site_id)
+            raise ApiError(409, "site_managed_by_operator",
+                           "this site is managed by the hub operator; contact the operator to link it")
         if tenant is not None and tenant.status == "disabled":
             raise ApiError(403, "host_blocked", "this site cannot be registered; contact the hub operator")
         if tenant is None:
@@ -706,6 +714,16 @@ class RegistrationAPI:
             self.registry.set_status(tenant.site_id, "pending")
             logger.warning("self-registration: %s re-registered more than 3 times in 24h; set pending", host_key)
             raise ApiError(429, "rate_limited", "too many re-registrations; the site is held for review", DAY)
+        # Decided 2026-11-03 (§8.3 #4): teacher grants survive only when the re-registering site is
+        # the same Moodle (same site_identifier_hash as recorded). Otherwise (another installation
+        # on this host, e.g. a domain takeover or a fresh reinstall) every grant is revoked.
+        same_site = tenant.site_identifier_hash is not None and hmac.compare_digest(
+            tenant.site_identifier_hash, req.site_identifier_hash
+        )
+        if not same_site:
+            revoked = self.registry.revoke_grants(tenant.site_id)
+            logger.warning("self-registration: %s re-registered as a different Moodle site"
+                           " (site identifier changed); revoked %d grant(s)", tenant.site_id, revoked)
         self.registry.record_verification(
             tenant.site_id, plugin_version=req.plugin_version, moodle_release=req.moodle_release,
             site_identifier_hash=req.site_identifier_hash, consent_version=req.terms_version,
@@ -713,8 +731,11 @@ class RegistrationAPI:
         )
         tenant = self.registry.get(tenant.site_id) or tenant
         issued = self.store.issue(tenant.site_id)  # current (if any) keeps working until confirm
-        logger.info("self-registration: re-registered site=%s version=%s", tenant.site_id, issued.version)
-        return 200, self.issued_payload(tenant, issued), tenant.site_id, "reregistered"
+        logger.info("self-registration: re-registered site=%s version=%s grants_kept=%s",
+                    tenant.site_id, issued.version, same_site)
+        payload = self.issued_payload(tenant, issued)
+        payload["grants_kept"] = same_site
+        return 200, payload, tenant.site_id, "reregistered"
 
     # --- confirm / rotate / status --------------------------------------------------------
     def site_action(self, scope: Any, site_key: str, action: str, body: Any) -> tuple[int, dict[str, Any]]:
@@ -751,7 +772,7 @@ class RegistrationAPI:
             "site_key": tenant.site_id,
             "status": tenant.status,
             "tier": tenant.tier,
-            "limits": dict(LIMITED_LIMITS),
+            "limits": self.config.limits.describe(),
             "mcp_url": self.mcp_url(tenant),
             "legacy_mcp_url": self.legacy_mcp_url(tenant),
             "secret_version": version,

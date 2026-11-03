@@ -574,6 +574,30 @@ class Registry:
             return None
         return tenant
 
+    def revoke_grants(self, site_id: str) -> int:
+        """Revoke every teacher OAuth grant (and its tokens) of a tenant; returns the count.
+
+        The Moodle-side user tokens are not contacted here: callers use this when the site behind
+        the tenant can no longer be trusted to be the one that issued them.
+        """
+        now = _now()
+        with self._connect() as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'oauth_grants'"
+            ).fetchone()
+            if exists is None:
+                return 0
+            conn.execute(
+                "UPDATE oauth_tokens SET used_at = ? WHERE used_at IS NULL AND grant_id IN"
+                " (SELECT grant_id FROM oauth_grants WHERE site_id = ? AND revoked_at IS NULL)",
+                (now, site_id),
+            )
+            cur = conn.execute(
+                "UPDATE oauth_grants SET revoked_at = ? WHERE site_id = ? AND revoked_at IS NULL",
+                (now, site_id),
+            )
+            return cur.rowcount
+
     def set_status(self, site_id: str, status: str) -> None:
         if status not in TENANT_STATUSES:
             raise TenantError("invalid status")

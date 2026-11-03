@@ -99,7 +99,7 @@ async def test_register_confirm_status(make_hub):
     assert data["secret_version"] == 1 and data["secret_state"] == "pending_confirm"
     assert len(data["site_secret"]) == 43
     assert data["tenant"] == {"status": "active", "tier": "limited",
-                              "limits": {"max_teachers": 5, "daily_tool_calls": 300, "concurrency": 1, "llm_proxy": False}}
+                              "limits": {"max_teachers": 5, "daily_requests": 200, "concurrency": 1, "llm_proxy": False}}
     assert data["mcp_url"] == f"{HUB}/m/{HOST_KEY}/mcp"
     assert data["legacy_mcp_url"] == f"{HUB}/t/{key}/mcp"
     assert data["confirm_url"] == f"{HUB}/api/v1/sites/{key}/confirm"
