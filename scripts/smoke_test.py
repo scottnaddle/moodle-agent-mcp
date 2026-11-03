@@ -2,13 +2,13 @@
 """Smoke test for a deployed Moodle MCP server.
 
 Usage:
-  MCP_URL=https://mcp.example.com/mcp MCP_BEARER_TOKEN_FILE=~/.config/moodle-mcp/token \
+  MCP_URL=https://mcp.example.com/mcp MCP_BEARER_TOKEN_FILE=~/.config/moodle-mcp/token [SMOKE_COURSE_ID=<id>] \
       python3 scripts/smoke_test.py [--write]
 
-Read-only by default. --write also creates a throwaway course "MCP-SMOKE-<ts>" with a section and a page
-(delete it afterwards). Requires: pip install "mcp>=1.26,<2".
+Read-only by default. --write also adds a section, a page and an assignment to the existing test course
+SMOKE_COURSE_ID (delete them afterwards; course creation is not exposed via MCP). Requires: pip install "mcp>=1.26,<2".
 """
-import asyncio, json, os, sys, time
+import asyncio, json, os, sys
 from pathlib import Path
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
@@ -49,19 +49,16 @@ async def main():
         async with ClientSession(r, w) as s:
             await s.initialize()
             tools = (await s.list_tools()).tools
-            n = len(tools); good = n == 39; ok += good; fail += not good
+            n = len(tools); good = n == 38; ok += good; fail += not good
             print(f"[{'PASS' if good else 'FAIL'}] list_tools: {n} tools")
             await step(s, "site_info", "site_info", {}, lambda d: "release" in str(d))
             await step(s, "list_categories", "list_categories", {})
             await step(s, "list_courses", "list_courses", {})
             if WRITE:
-                sn = f"MCP-SMOKE-{int(time.time())}"
-                await step(s, "create_course preview", "create_course", {"fullname": sn, "shortname": sn, "confirm": False})
-                d = await step(s, "create_course", "create_course", {"fullname": sn, "shortname": sn, "numsections": 1, "confirm": True})
-                cid = d.get("courseid") if isinstance(d, dict) else None
-                if isinstance(d, dict) and d.get("enrol_error"):
-                    fail += 1; print("[FAIL] bot enrolment as editingteacher:", d["enrol_error"][:120])
-                if cid:
+                cid = int(os.environ.get("SMOKE_COURSE_ID") or 0)
+                if not cid:
+                    fail += 1; print("[FAIL] --write needs SMOKE_COURSE_ID (an existing test course)")
+                else:
                     await step(s, "get_course_outline", "get_course_outline", {"course_id": cid})
                     await step(s, "add_sections (local_ubionai)", "add_sections", {"course_id": cid, "names": ["Smoke"], "confirm": True})
                     await step(s, "create_page (local_ubionai)", "create_page", {"course_id": cid, "section": 1, "name": "Hello", "content_html": "<p>hi</p>", "confirm": True})

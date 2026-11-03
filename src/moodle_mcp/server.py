@@ -111,7 +111,6 @@ OPTIONAL_HINT = (
     "This tool needs the optional Moodle plugin {plugin}. If it is not installed (or its web service functions "
     "are not in the external service), this tool cannot work; all other tools are unaffected."
 )
-EDITINGTEACHER_ROLE_ID = int(os.environ.get("MOODLE_EDITINGTEACHER_ROLE_ID") or "3")  # blank in .env -> default
 WRITE_NOTE = "WRITE - only call after the teacher confirmed."
 CONFIRM_NOTE = "Call first with confirm=false to get a preview; call again with confirm=true after the teacher agrees."
 PREVIEW_NOTE = "Nothing changed. Re-call with confirm=true."
@@ -129,8 +128,6 @@ YOUTUBE_RE = re.compile(
 VIMEO_RE = re.compile(r"vimeo\.com/(?:video/)?(\d+)")
 WRITE_FUNCTIONS = frozenset(
     {
-        "core_course_create_courses",
-        "enrol_manual_enrol_users",
         "mod_assign_save_grade",
         "mod_assign_save_grades",
         "core_files_upload",
@@ -687,55 +684,6 @@ def create_mcp(client: MoodleClient | None) -> FastMCP:
     async def list_categories() -> dict[str, Any]:
         """List course categories (id, name, parent, coursecount)."""
         return await call("core_course_get_categories", key="categories")
-
-    @mcp.tool(
-        description=f"{WRITE_NOTE} Create a course (core_course_create_courses) and enrol the bot as editingteacher. "
-        "Call first with confirm=false to get a preview; call again with confirm=true after the teacher agrees. "
-        "format: topics|weeks|singleactivity|social. startdate: unix timestamp."
-    )
-    async def create_course(
-        fullname: str,
-        shortname: str,
-        categoryid: int = 1,
-        format: str = "topics",
-        numsections: int | None = None,
-        visible: int = 1,
-        startdate: int | None = None,
-        summary: str = "",
-        confirm: bool = False,
-    ) -> dict[str, Any]:
-        course: dict[str, Any] = {
-            "fullname": fullname,
-            "shortname": shortname,
-            "categoryid": categoryid,
-            "format": format,
-            "visible": visible,
-            "summary": summary,
-            "summaryformat": 1,
-        }
-        if numsections is not None:
-            course["courseformatoptions"] = [{"name": "numsections", "value": str(numsections)}]
-        if startdate is not None:
-            course["startdate"] = startdate
-        if not confirm:
-            return {"preview": True, "course": course, "note": "Not created. Re-call with confirm=true."}
-        created = await call("core_course_create_courses", key="courses", courses=[course])
-        if "error" in created:
-            return created
-        courseid = created["courses"][0]["id"]
-        info = await call("core_webservice_get_site_info")
-        if "error" in info:
-            return {"ok": True, "courseid": courseid, "enrol_error": info["error"]}
-        enrol = await call(
-            "enrol_manual_enrol_users",
-            enrolments=[{"roleid": EDITINGTEACHER_ROLE_ID, "userid": info["userid"], "courseid": courseid}],
-        )
-        out: dict[str, Any] = {"ok": True, "courseid": courseid, "shortname": created["courses"][0].get("shortname")}
-        if "error" in enrol:
-            out["enrol_error"] = enrol["error"]
-        else:
-            out["enrolled_userid"] = info["userid"]
-        return out
 
     @mcp.tool(description=f"{WRITE_NOTE} Save a grade and feedback comment for one student's assignment submission.")
     async def grade_submission(

@@ -44,12 +44,12 @@ sudo -u www-data php moodle-setup/setup_ubionai_ws.php --moodle=/var/www/moodle 
 스크립트가 하는 일(수작업으로 해도 동일):
 1. **웹 서비스 활성화** + **REST 프로토콜 활성화** (`enablewebservices=1`, `webserviceprotocols`에 `rest`).
 2. **전용 사용자** `svc_ubionai` (manual 인증, 랜덤 비밀번호 — 로그인용 아님, 토큰 전용).
-3. **역할** `ubionai_service`: manager 아키타입 권한 + `webservice/rest:use` 등, **시스템 컨텍스트에 부여**. editingteacher/teacher/student 배정 허용(강좌 생성 시 봇을 editingteacher로 등록하기 위해).
-4. **외부 서비스** `ubionai` (`restrictedusers=1`, 파일 업/다운로드 허용) + 함수 44개(코어/모듈 30 · mod_attendance 5(선택) · local_ubionai 9). 사이트에 없는 함수는 `[skip]`으로 건너뜁니다.
+3. **역할** `ubionai_service`: manager 아키타입 권한 + `webservice/rest:use` 등, **시스템 컨텍스트에 부여**. editingteacher/teacher/student 배정 허용.
+4. **외부 서비스** `ubionai` (`restrictedusers=1`, 파일 업/다운로드 허용) + 함수 42개(코어/모듈 28 · mod_attendance 5(선택) · local_ubionai 9). 사이트에 없는 함수는 `[skip]`으로 건너뜁니다.
 5. 서비스에 `svc_ubionai` **허가된 사용자** 등록 (선택: IP 제한).
 6. **영구 토큰 발급** → `--token-file` (mode 600). 화면에 출력하지 않습니다. `--no-token`이면 발급 생략(재실행 시 토큰이 계속 늘지 않게).
 
-> 최소 권한을 더 원하면 `ubionai_service` 역할에서 안 쓰는 권한을 빼면 됩니다. 시스템 manager 수준이 필요한 건 주로 `create_course`(강좌 생성·카테고리 조회)와 배지/성적 카테고리입니다. 쓰기 도구를 아예 안 쓸 거면 서비스 함수에서 쓰기 함수를 빼고 역할도 읽기 권한만 남기세요.
+> 최소 권한을 더 원하면 `ubionai_service` 역할에서 안 쓰는 권한을 빼면 됩니다. 시스템 manager 수준이 필요한 건 주로 카테고리 조회와 배지/성적 카테고리입니다. (강좌 생성은 정책상 MCP로 제공하지 않습니다 — AI는 기존 강좌에서만 작업합니다.) 쓰기 도구를 아예 안 쓸 거면 서비스 함수에서 쓰기 함수를 빼고 역할도 읽기 권한만 남기세요.
 
 ## 3. MCP 서버 (Docker)
 아래 `docker` 명령은 root 또는 `docker` 그룹 사용자로 실행합니다(`sudo usermod -aG docker $USER` 후 재로그인).
@@ -107,12 +107,12 @@ MCP_URL=https://mcp.example.com/mcp MCP_TOKEN_FILE=~/.config/moodle-mcp/token cl
 ```bash
 python3 -m venv .venv && .venv/bin/pip install "mcp>=1.26,<2"
 MCP_URL=https://mcp.example.com/mcp MCP_BEARER_TOKEN_FILE=~/.config/moodle-mcp/token .venv/bin/python scripts/smoke_test.py          # 읽기만
-MCP_URL=https://mcp.example.com/mcp MCP_BEARER_TOKEN_FILE=~/.config/moodle-mcp/token .venv/bin/python scripts/smoke_test.py --write  # 테스트 강좌 생성
+MCP_URL=https://mcp.example.com/mcp MCP_BEARER_TOKEN_FILE=~/.config/moodle-mcp/token SMOKE_COURSE_ID=<id> .venv/bin/python scripts/smoke_test.py --write  # 기존 테스트 강좌에 쓰기 (SMOKE_COURSE_ID 필요)
 ```
 - `MCP_URL`을 빼면 `http://127.0.0.1:8791/mcp`(서버 로컬)로 붙습니다. 사설 CA 인증서면 `SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt`(CA를 OS 저장소에 넣은 뒤)처럼 지정하세요.
 
-기대 결과: `list_tools: 39 tools`, site_info/list_categories/list_courses PASS, `--write` 시 `MCP-SMOKE-<ts>` 강좌 + 섹션·페이지·과제 생성 PASS. 끝나면 테스트 강좌는 Moodle에서 삭제하세요.
-에이전트에게는 "site_info 보여줘", "강좌 목록 보여줘", "테스트 강좌 하나 만들어 줘(미리보기 먼저)" 정도로 확인하면 됩니다.
+기대 결과: `list_tools: 38 tools`, site_info/list_categories/list_courses PASS, `--write` 시 `SMOKE_COURSE_ID`로 지정한 **기존** 테스트 강좌에 섹션·페이지·과제 생성 PASS. 끝나면 추가된 섹션/활동은 Moodle에서 삭제하세요.
+에이전트에게는 "site_info 보여줘", "강좌 목록 보여줘", "테스트 강좌에 페이지 하나 만들어 줘(미리보기 먼저)" 정도로 확인하면 됩니다.
 
 ## 7. 보안 체크리스트
 - [ ] **최소 권한**: 전용 사용자·전용 역할·`restrictedusers=1` 서비스. admin 토큰, `moodle_mobile_app` 서비스 토큰 사용 금지. 쓰기 도구가 필요 없으면 쓰기 함수 제거.

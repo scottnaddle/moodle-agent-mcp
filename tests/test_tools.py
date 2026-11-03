@@ -4,14 +4,15 @@ import pytest
 import respx
 
 from moodle_mcp.moodle import MoodleClient
-from moodle_mcp.server import WRITE_NOTE, create_mcp
+from moodle_mcp.oauth import USER_SERVICE_FUNCTIONS
+from moodle_mcp.server import WRITE_FUNCTIONS, WRITE_NOTE, create_mcp
 
 from .conftest import ENDPOINT, MOODLE_TOKEN
 from .test_moodle import form
 
 BASE = {"wstoken": MOODLE_TOKEN, "moodlewsrestformat": "json"}
 WRITE_TOOLS = {
-    "create_course", "create_assignment", "create_quiz", "create_forum", "create_page", "create_resource",
+    "create_assignment", "create_quiz", "create_forum", "create_page", "create_resource",
     "update_activity", "set_activity_visibility", "set_completion", "set_access_restriction",
     "add_quiz_questions", "add_sections", "update_section", "post_forum_discussion",
     "create_workshop", "create_wiki", "create_glossary", "create_feedback", "create_h5pactivity", "create_openmaic",
@@ -177,7 +178,7 @@ async def test_write_tools_are_marked(mcp):
     assert set(tools) == {
         "site_info", "list_courses", "get_course_outline", "list_students", "list_assignments",
         "get_submissions", "get_assignment_grades", "gradebook_overview", "list_quizzes", "list_quiz_attempts", "review_attempt",
-        "attendance_sessions", "grade_submission", "bulk_grade", "list_categories", "create_course",
+        "attendance_sessions", "grade_submission", "bulk_grade", "list_categories",
         "list_forum_discussions", *WRITE_TOOLS,
     }  # fmt: skip
     writes = {"grade_submission", "bulk_grade", *WRITE_TOOLS}
@@ -187,30 +188,10 @@ async def test_write_tools_are_marked(mcp):
         assert "WRITE" not in (tools[name].description or "")
 
 
-async def test_create_course_preview_does_not_call_moodle(mcp):
-    with respx.mock:
-        route = respx.post(ENDPOINT).respond(text="{}")
-        _c, out = await mcp.call_tool("create_course", {"fullname": "F", "shortname": "S", "numsections": 4})
-        assert route.call_count == 0
-    assert out["preview"] is True
-    assert out["course"]["courseformatoptions"] == [{"name": "numsections", "value": "4"}]
-
-
-async def test_create_course_confirm_creates_and_enrols(mcp):
-    replies = {
-        "core_course_create_courses": [{"id": 42, "shortname": "S"}],
-        "core_webservice_get_site_info": {"userid": 10},
-        "enrol_manual_enrol_users": None,
-    }
-    with respx.mock:
-        route = respx.post(ENDPOINT).mock(
-            side_effect=lambda req: respx.MockResponse(text=json.dumps(replies[form(req)["wsfunction"]]))
-        )
-        _c, out = await mcp.call_tool(
-            "create_course", {"fullname": "F", "shortname": "S", "categoryid": 1, "confirm": True}
-        )
-        calls = [form(c.request) for c in route.calls]
-    assert out == {"ok": True, "courseid": 42, "shortname": "S", "enrolled_userid": 10}
-    assert calls[0]["courses[0][fullname]"] == "F" and calls[0]["courses[0][categoryid]"] == "1"
-    assert calls[2]["enrolments[0][roleid]"] == "3"
-    assert calls[2]["enrolments[0][userid]"] == "10" and calls[2]["enrolments[0][courseid]"] == "42"
+async def test_course_creation_is_not_exposed(mcp):
+    # Policy: the AI works only on existing courses; no course creation via MCP.
+    tools = {t.name for t in await mcp.list_tools()}
+    assert "create_course" not in tools
+    for fn in ("core_course_create_courses", "enrol_manual_enrol_users"):
+        assert fn not in WRITE_FUNCTIONS
+        assert fn not in USER_SERVICE_FUNCTIONS
