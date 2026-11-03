@@ -15,15 +15,19 @@ delegated to the tenant's Moodle (plugin ``local_ubionai`` 0.6.0-spike2):
 4. The client gets hub access/refresh tokens; MCP calls with an access token run with the
    teacher's own Moodle token.
 
-Hub <-> plugin messages are signed with the tenant shared secret read from
-``$UBIONAI_HUB_TENANT_SECRETS_DIR/<site>/oauth.secret``. A tenant without that file keeps working
-with its static bearer only; the static bearer keeps working for tenants that have it.
+Hub <-> plugin messages are signed by the tenant's ``SiteAuthenticator`` (``siteauth``):
+``auth_mode=legacy_file`` reads ``$UBIONAI_HUB_TENANT_SECRETS_DIR/<site>/oauth.secret`` (a tenant
+without that file keeps working with its static bearer only); ``auth_mode=shared_secret``
+(self-registered, ``registration``) uses the confirmed site credential's MAC key and adds ``kv``.
+
+The same tenant is also reachable as ``/m/<host_key>/…`` (``TenantRef``); each URL family is its
+own issuer / resource, so tokens do not cross between them. Self-registered tenants are reached
+only through ``PinnedPublicTransport`` (resolve, vet public, pin the IP on every connection).
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
 import hashlib
 import hmac
 import html
@@ -33,7 +37,6 @@ import logging
 import os
 import re
 import secrets
-import socket
 import stat
 import time
 from dataclasses import dataclass, field
@@ -47,13 +50,36 @@ from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Re
 from starlette.routing import Route
 from starlette.types import Receive, Scope, Send
 
-from .crypto import Kek, open_, seal
+from .crypto import PURPOSE_DCR_STATELESS, Kek, derive_key, open_, seal
+from .limits import TierLimits
 from .moodle import MoodleClient, MoodleError
+from .netutil import (
+    BlockedAddress,
+    PinnedPublicTransport,
+    ResolveError,
+    Resolver,
+    ip_allowed,  # noqa: F401 - re-exported (tests, callers of the spike API)
+    vet_host,
+)
+from .netutil import system_resolve as _system_resolve
+from .regpage import page_language, render_site_page
 from .registry import SITE_ID_RE, Registry, Tenant, ws_endpoint
+from .siteauth import (
+    MAC_PREFIX,  # noqa: F401 - re-exported
+    FileSecretAuthenticator,
+    SharedSecretCredentialStore,
+    SiteAuthenticator,
+    b64url,
+    sign_message,  # noqa: F401 - re-exported
+    unb64url,
+    verify_message,  # noqa: F401 - re-exported
+)
 
 logger = logging.getLogger(__name__)
 
 SCOPES = ["moodle:read", "moodle:write"]
+# error_description when a limited-tier site already has its maximum number of teachers.
+TEACHER_LIMIT_ERROR = "teacher_limit_reached"
 ALLOWED_REDIRECTS = (
     "https://claude.ai/api/mcp/auth_callback",
     "https://claude.com/api/mcp/auth_callback",
@@ -66,7 +92,7 @@ BACKCHANNEL_TTL = 60
 ACCESS_TTL = 3600
 REFRESH_TTL = 30 * 86400
 COOKIE = "ubionai_oauth"
-MAC_PREFIX = b"ubionai-oauth-v1."
+STATELESS_DCR_PREFIX = "dcr_s1."
 # Functions of the plugin's ubionai_user service (local_ubionai db/services.php). A token whose
 # site_info lists anything else (moodle_mobile_app, a manual service, injected functions) is refused.
 USER_SERVICE_FUNCTIONS = frozenset(
@@ -135,32 +161,8 @@ def _hash(token: str) -> bytes:
     return hashlib.sha256(token.encode()).digest()
 
 
-def _b64(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
-
-
-def _unb64(data: str) -> bytes:
-    return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
-
-
-def sign_message(secret: bytes, claims: dict[str, Any]) -> str:
-    """``base64url(json) "." base64url(HMAC-SHA256(secret, "ubionai-oauth-v1." + body))``."""
-    body = _b64(json.dumps(claims, separators=(",", ":"), sort_keys=True).encode())
-    return body + "." + _b64(hmac.new(secret, MAC_PREFIX + body.encode(), hashlib.sha256).digest())
-
-
-def verify_message(secret: bytes, token: str, typ: str) -> dict[str, Any] | None:
-    try:
-        body, mac = token.split(".", 1)
-        expected = hmac.new(secret, MAC_PREFIX + body.encode(), hashlib.sha256).digest()
-        if not hmac.compare_digest(_unb64(mac), expected):
-            return None
-        claims = json.loads(_unb64(body))
-    except (ValueError, json.JSONDecodeError):
-        return None
-    if not isinstance(claims, dict) or claims.get("typ") != typ or claims.get("exp", 0) < _now():
-        return None
-    return claims
+_b64 = b64url
+_unb64 = unb64url
 
 
 def validate_public_url(url: str) -> str:
@@ -265,6 +267,35 @@ class AuthRequest:
     scope: str
     bind: str
     exp: float
+    base_path: str = ""
+
+
+@dataclass(frozen=True)
+class TenantRef:
+    """A tenant as addressed by one URL family: ``/t/<site_id>`` or ``/m/<host_key>`` (contract §6.3).
+
+    issuer / resource / cookie path derive from ``base_path``, so a token issued for one family is
+    refused on the other (separate RFC 8707 audiences).
+    """
+
+    site_id: str
+    base_path: str
+
+    @classmethod
+    def legacy(cls, site_id: str) -> "TenantRef":
+        return cls(site_id, f"/t/{site_id}")
+
+    @classmethod
+    def host(cls, site_id: str, host_key: str) -> "TenantRef":
+        return cls(site_id, f"/m/{host_key}")
+
+    @property
+    def host_key(self) -> str | None:
+        return self.base_path[3:] if self.base_path.startswith("/m/") else None
+
+
+def _as_ref(ref: "TenantRef | str") -> TenantRef:
+    return ref if isinstance(ref, TenantRef) else TenantRef.legacy(ref)
 
 
 @dataclass
@@ -302,10 +333,6 @@ class CimdError(Exception):
     """A Client ID Metadata Document could not be fetched or is unusable (reason is log-safe)."""
 
 
-Resolver = Callable[[str, int], Awaitable[list[str]]]
-_NAT64 = ipaddress.ip_network("64:ff9b::/96")
-
-
 def cimd_url_ok(client_id: str) -> bool:
     """CIMD client_id: https URL with a host and a real path; no userinfo, fragment or dot segments."""
     try:
@@ -319,32 +346,6 @@ def cimd_url_ok(client_id: str) -> bool:
         return False
     segments = parts.path.split("/")
     return len(parts.path) > 1 and not any(seg in (".", "..") for seg in segments)
-
-
-def ip_allowed(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    """Only globally routable unicast addresses (IPv4-mapped / 6to4 / NAT64 checked as their IPv4)."""
-    if isinstance(ip, ipaddress.IPv6Address):
-        if ip.ipv4_mapped is not None:
-            return ip_allowed(ip.ipv4_mapped)
-        if ip.sixtofour is not None:
-            return ip_allowed(ip.sixtofour)
-        if ip.teredo is not None:
-            return False
-        if ip in _NAT64:
-            return ip_allowed(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF))
-    return ip.is_global and not (
-        ip.is_private
-        or ip.is_loopback
-        or ip.is_link_local
-        or ip.is_multicast
-        or ip.is_reserved
-        or ip.is_unspecified
-    )
-
-
-async def _system_resolve(host: str, port: int) -> list[str]:
-    infos = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
-    return [str(info[4][0]).split("%", 1)[0] for info in infos]
 
 
 def _max_age(cache_control: str) -> int | None:
@@ -411,16 +412,9 @@ class CimdFetcher:
 
     async def _vetted_ip(self, host: str, port: int) -> str:
         try:
-            literal = ipaddress.ip_address(host.strip("[]"))
-        except ValueError:
-            literal = None
-        addresses = [str(literal)] if literal is not None else await self.resolve(host, port)
-        if not addresses:
-            raise CimdError("host did not resolve")
-        ips = [ipaddress.ip_address(a) for a in addresses]
-        if not all(ip_allowed(ip) for ip in ips):
-            raise CimdError("host resolves to a non-public address")
-        return str(ips[0])
+            return await vet_host(host, port, self.resolve)
+        except (ResolveError, BlockedAddress) as exc:
+            raise CimdError(str(exc)) from None
 
     async def _fetch(self, url: str) -> tuple[dict[str, Any], int]:
         async with httpx.AsyncClient(
@@ -534,6 +528,15 @@ class OAuthServer:
     refresh_ttl: int = REFRESH_TTL
     requests: dict[str, AuthRequest] = field(default_factory=dict)
     codes: dict[bytes, PendingCode] = field(default_factory=dict)
+    # Hub -> Moodle transport for self-registered tenants: resolves, vets and pins every
+    # connection to a public IP (contract §4.3). Defaults to PinnedPublicTransport(transport).
+    pinned_transport: httpx.AsyncBaseTransport | None = None
+    # UBIONAI_HUB_LEGACY_TENANT_ROUTES=0: /t/<site> serves operator tenants only.
+    legacy_self_registered: bool = True
+    # Rate limit for the static "ask your administrator" page (IP -> 60/min).
+    page_limit: Callable[[Request], int | None] | None = None
+    # tier=limited: at most limits.max_teachers distinct teachers with a live grant (§8.3 #2).
+    limits: TierLimits = field(default_factory=TierLimits)
     _tasks: set[asyncio.Task[Any]] = field(default_factory=set)
 
     def __post_init__(self) -> None:
@@ -541,43 +544,82 @@ class OAuthServer:
         with self.registry._connect() as conn:
             conn.executescript(_SCHEMA)
             conn.execute("UPDATE meta SET schema_version = 5 WHERE schema_version < 5")
+        if self.pinned_transport is None:
+            self.pinned_transport = PinnedPublicTransport(self.transport)
+        self.credentials = SharedSecretCredentialStore(self.registry, self.kek)
         self.router = Starlette(routes=self._routes())
 
     # --- tenancy / urls -------------------------------------------------------------------
-    def issuer(self, site: str) -> str:
-        return f"{self.public_url}/t/{site}"
+    def issuer(self, ref: TenantRef | str) -> str:
+        return self.public_url + _as_ref(ref).base_path
 
-    def resource(self, site: str) -> str:
-        return f"{self.public_url}/t/{site}/mcp"
+    def resource(self, ref: TenantRef | str) -> str:
+        return self.issuer(ref) + "/mcp"
 
-    def prm_url(self, site: str) -> str:
-        return f"{self.public_url}/.well-known/oauth-protected-resource/t/{site}/mcp"
+    def prm_url(self, ref: TenantRef | str) -> str:
+        return f"{self.public_url}/.well-known/oauth-protected-resource{_as_ref(ref).base_path}/mcp"
 
     def secret(self, site: str) -> bytes | None:
+        if not self.secrets_dir:
+            return None
         return load_tenant_secret(self.secrets_dir, site)
 
-    def tenant(self, site: str) -> tuple[Tenant, bytes] | None:
-        """Active tenant with a usable shared secret, else None (OAuth off for that site)."""
+    def authenticator(self, tenant: Tenant) -> SiteAuthenticator | None:
+        """Message signer chosen by the tenant's auth_mode (contract §7.1)."""
+        if tenant.auth_mode == "legacy_file":
+            secret = self.secret(tenant.site_id)
+            return FileSecretAuthenticator(secret) if secret is not None else None
+        if tenant.auth_mode == "shared_secret":
+            return self.credentials.authenticator(tenant.site_id, tenant.moodle_url)
+        return None  # signature: option 2, not implemented
+
+    def transport_for(self, tenant: Tenant) -> httpx.AsyncBaseTransport | None:
+        return self.pinned_transport if tenant.self_registered else self.transport
+
+    def tenant(self, site: str) -> tuple[Tenant, SiteAuthenticator] | None:
+        """Active tenant with a usable message signer, else None (OAuth off for that site)."""
         if not SITE_ID_RE.fullmatch(site):
             return None
         tenant = self.registry.get(site)
         if tenant is None or tenant.status != "active":
             return None
-        secret = self.secret(site)
-        return (tenant, secret) if secret is not None else None
+        auth = self.authenticator(tenant)
+        return (tenant, auth) if auth is not None else None
 
     def enabled(self, site: str) -> bool:
         return self.tenant(site) is not None
 
-    def challenge(self, site: str, error: str | None = None) -> bytes:
-        value = f'Bearer resource_metadata="{self.prm_url(site)}", scope="{" ".join(SCOPES)}"'
+    def challenge(self, ref: TenantRef | str, error: str | None = None) -> bytes:
+        value = f'Bearer resource_metadata="{self.prm_url(ref)}", scope="{" ".join(SCOPES)}"'
         if error:
             value += f', error="{error}"'
         return value.encode()
 
+    def _ref(self, request: Request) -> TenantRef:
+        ref = request.scope.get("ubionai.ref")
+        return ref if isinstance(ref, TenantRef) else TenantRef.legacy(request.path_params["site"])
+
+    def _found(self, request: Request) -> tuple[TenantRef, Tenant, SiteAuthenticator] | None:
+        ref = self._ref(request)
+        found = self.tenant(ref.site_id)
+        if found is None:
+            return None
+        if ref.host_key is None and found[0].self_registered and not self.legacy_self_registered:
+            return None
+        if ref.host_key is not None and found[0].host_key != ref.host_key:
+            return None
+        return ref, found[0], found[1]
+
+    def _ref_for_grant(self, grant: Grant) -> TenantRef:
+        base = grant.resource[len(self.public_url):] if grant.resource.startswith(self.public_url) else ""
+        base = base[: -len("/mcp")] if base.endswith("/mcp") else ""
+        return TenantRef(grant.site_id, base) if base else TenantRef.legacy(grant.site_id)
+
     # --- RS -------------------------------------------------------------------------------
-    def authenticate(self, site: str, bearer: str) -> Grant | None:
-        """Access token -> live grant for this site (audience = this tenant's MCP URL)."""
+    def authenticate(self, ref: TenantRef | str, bearer: str) -> Grant | None:
+        """Access token -> live grant for this site (audience = the MCP URL it was issued for)."""
+        ref = _as_ref(ref)
+        site = ref.site_id
         now = _now()
         with self.registry._connect() as conn:
             row = conn.execute(
@@ -592,9 +634,24 @@ class OAuthServer:
         if row is None:
             return None
         grant = Grant(*row)
-        if grant.site_id != site or grant.resource != self.resource(site):
-            return None  # RFC 8707 audience; no token passthrough across tenants
+        if grant.site_id != site or grant.resource != self.resource(ref):
+            return None  # RFC 8707 audience; no token passthrough across tenants or URL families
         return grant
+
+    def teacher_limit_reached(self, tenant: Tenant, userid: int) -> bool:
+        """A new teacher would exceed the tier's limit. Teachers already holding a live grant
+        (reconnecting, a second client) are always allowed."""
+        if tenant.tier != "limited":
+            return False
+        now = _now()
+        with self.registry._connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT moodle_userid FROM oauth_grants"
+                " WHERE site_id = ? AND revoked_at IS NULL AND valid_until > ?",
+                (tenant.site_id, now),
+            ).fetchall()
+        teachers = {row[0] for row in rows}
+        return userid not in teachers and len(teachers) >= self.limits.max_teachers
 
     def user_token(self, tenant: Tenant, grant: Grant) -> bytearray:
         return open_(
@@ -614,6 +671,69 @@ class OAuthServer:
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         await self.router(scope, receive, send)
 
+    def host_ready(self, tenant: Tenant | None) -> bool:
+        """The tenant behind /m/<host_key> can run OAuth (active + message signer)."""
+        return tenant is not None and tenant.host_key is not None and self.enabled(tenant.site_id)
+
+    async def serve_host_route(
+        self, scope: Scope, receive: Receive, send: Send, kind: str, endpoint: str, host_key: str, tenant: Tenant | None
+    ) -> None:
+        """``/m/<host_key>`` OAuth + metadata (contract §5.1, §6).
+
+        A ready tenant is served by the normal handlers with a ``/m/`` TenantRef (path rewritten
+        to the ``/t/`` route internally). Otherwise metadata and DCR answer statically (nothing is
+        fetched or stored for an arbitrary host) and authorize shows the "ask your administrator" page.
+        """
+        if self.host_ready(tenant):
+            assert tenant is not None
+            site = tenant.site_id
+            path = {
+                "prm": f"/.well-known/oauth-protected-resource/t/{site}/mcp",
+                "as_metadata": f"/.well-known/oauth-authorization-server/t/{site}",
+                "oauth": f"/t/{site}/oauth/{endpoint}",
+            }[kind]
+            inner = dict(scope, path=path, raw_path=path.encode())
+            inner["ubionai.ref"] = TenantRef.host(site, host_key)
+            await self.router(inner, receive, send)
+            return
+        ref = TenantRef("", f"/m/{host_key}")
+        request = Request(scope, receive)
+        response: Response
+        if kind == "prm":
+            response = JSONResponse(self._prm_doc(ref))
+        elif kind == "as_metadata":
+            response = JSONResponse(self._as_doc(ref))
+        elif kind == "oauth" and endpoint == "register" and request.method == "POST":
+            response = await self.stateless_register(request, host_key)
+        elif kind == "oauth" and endpoint == "authorize" and request.method == "GET":
+            response = self.site_page(request, ref, tenant)
+        else:
+            response = _oauth_error("invalid_request", "site not registered", 404)
+        await response(scope, receive, send)
+
+    def site_page(self, request: Request, ref: TenantRef, tenant: Tenant | None) -> Response:
+        if self.page_limit is not None:
+            wait = self.page_limit(request)
+            if wait is not None:
+                return _page("too many requests", 429)
+        if tenant is None:
+            kind = "unregistered"
+        elif tenant.status == "disabled":
+            kind = "disabled"
+        else:
+            kind = "pending"  # pending review, or not yet confirmed / no signer
+        redirect_uri = request.query_params.get("redirect_uri", "")
+        back = None
+        if redirect_uri and redirect_allowed(redirect_uri):
+            params = {"error": "access_denied", "error_description": "site_not_registered", "iss": self.issuer(ref)}
+            state = request.query_params.get("state")
+            if state is not None:
+                params["state"] = state
+            back = redirect_uri + ("&" if "?" in redirect_uri else "?") + urlencode(params)
+        return render_site_page(
+            kind, ref.host_key or "", page_language(request.headers.get("accept-language")), back
+        )
+
     def _routes(self) -> list[Route]:
         return [
             Route("/.well-known/oauth-protected-resource/t/{site}/mcp", self.prm),
@@ -627,52 +747,52 @@ class OAuthServer:
             Route("/t/{site}/oauth/revoke", self.revoke, methods=["POST"]),
         ]
 
-    def _site(self, request: Request) -> str | None:
-        site = request.path_params["site"]
-        return site if self.enabled(site) else None
+    def _site(self, request: Request) -> TenantRef | None:
+        found = self._found(request)
+        return found[0] if found is not None else None
 
     # --- metadata -------------------------------------------------------------------------
+    def _prm_doc(self, ref: TenantRef) -> dict[str, Any]:
+        return {
+            "resource": self.resource(ref),
+            "authorization_servers": [self.issuer(ref)],
+            "scopes_supported": SCOPES,
+            "bearer_methods_supported": ["header"],
+        }
+
+    def _as_doc(self, ref: TenantRef) -> dict[str, Any]:
+        iss = self.issuer(ref)
+        return {
+            "issuer": iss,
+            "authorization_endpoint": f"{iss}/oauth/authorize",
+            "token_endpoint": f"{iss}/oauth/token",
+            "registration_endpoint": f"{iss}/oauth/register",
+            "revocation_endpoint": f"{iss}/oauth/revoke",
+            "scopes_supported": SCOPES + ["offline_access"],
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code", "refresh_token"],
+            "code_challenge_methods_supported": ["S256"],
+            "token_endpoint_auth_methods_supported": ["none"],
+            "revocation_endpoint_auth_methods_supported": ["none"],
+            "client_id_metadata_document_supported": True,
+            "authorization_response_iss_parameter_supported": True,
+        }
+
     async def prm(self, request: Request) -> Response:
-        site = self._site(request)
-        if not site:
+        ref = self._site(request)
+        if not ref:
             return JSONResponse({"error": "not found"}, status_code=404)
-        return JSONResponse(
-            {
-                "resource": self.resource(site),
-                "authorization_servers": [self.issuer(site)],
-                "scopes_supported": SCOPES,
-                "bearer_methods_supported": ["header"],
-            }
-        )
+        return JSONResponse(self._prm_doc(ref))
 
     async def as_metadata(self, request: Request) -> Response:
-        site = self._site(request)
-        if not site:
+        ref = self._site(request)
+        if not ref:
             return JSONResponse({"error": "not found"}, status_code=404)
-        iss = self.issuer(site)
-        return JSONResponse(
-            {
-                "issuer": iss,
-                "authorization_endpoint": f"{iss}/oauth/authorize",
-                "token_endpoint": f"{iss}/oauth/token",
-                "registration_endpoint": f"{iss}/oauth/register",
-                "revocation_endpoint": f"{iss}/oauth/revoke",
-                "scopes_supported": SCOPES + ["offline_access"],
-                "response_types_supported": ["code"],
-                "grant_types_supported": ["authorization_code", "refresh_token"],
-                "code_challenge_methods_supported": ["S256"],
-                "token_endpoint_auth_methods_supported": ["none"],
-                "revocation_endpoint_auth_methods_supported": ["none"],
-                "client_id_metadata_document_supported": True,
-                "authorization_response_iss_parameter_supported": True,
-            }
-        )
+        return JSONResponse(self._as_doc(ref))
 
     # --- clients --------------------------------------------------------------------------
-    async def register(self, request: Request) -> Response:
-        site = self._site(request)
-        if not site:
-            return JSONResponse({"error": "not found"}, status_code=404)
+    async def _client_metadata(self, request: Request) -> tuple[list[str], str | None, list[str]] | Response:
+        """Validated DCR body -> (redirect_uris, client_name, grant_types), or an error response."""
         try:
             body = await request.json()
         except (ValueError, json.JSONDecodeError):
@@ -692,8 +812,10 @@ class OAuthServer:
             return _oauth_error("invalid_client_metadata", "unsupported grant_types")
         name = body.get("client_name")
         name = name[:200] if isinstance(name, str) else None
-        client = Client("dcr_" + secrets.token_urlsafe(16), list(uris), name, "dcr")
-        self._save_client(site, client)
+        return list(uris), name, grants
+
+    @staticmethod
+    def _dcr_response(client: Client, grants: list[str]) -> Response:
         return JSONResponse(
             {
                 "client_id": client.client_id,
@@ -706,6 +828,70 @@ class OAuthServer:
             },
             status_code=201,
         )
+
+    async def register(self, request: Request) -> Response:
+        ref = self._site(request)
+        if not ref:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        meta = await self._client_metadata(request)
+        if isinstance(meta, Response):
+            return meta
+        uris, name, grants = meta
+        client = Client("dcr_" + secrets.token_urlsafe(16), uris, name, "dcr")
+        self._save_client(ref.site_id, client)
+        return self._dcr_response(client, grants)
+
+    # Stateless DCR for /m/<host_key> before (or regardless of) registration (contract §5.1): the
+    # client_id carries its redirect URIs and is MACed with a KEK-derived key, so arbitrary hosts
+    # cannot fill the database, and the id stays valid once the site registers.
+    def _dcr_key(self) -> bytes:
+        return derive_key(self.kek, PURPOSE_DCR_STATELESS, "hub")
+
+    def stateless_client_id(self, host_key: str, uris: list[str], name: str | None) -> str:
+        body = b64url(
+            json.dumps({"h": host_key, "r": uris, "n": name, "iat": _now()}, separators=(",", ":"), sort_keys=True).encode()
+        )
+        mac = hmac.new(self._dcr_key(), (STATELESS_DCR_PREFIX + body).encode(), hashlib.sha256).digest()
+        return f"{STATELESS_DCR_PREFIX}{body}.{b64url(mac)}"
+
+    def _stateless_client(self, client_id: str, host_key: str | None) -> Client | None:
+        if host_key is None or not client_id.startswith(STATELESS_DCR_PREFIX) or len(client_id) > 4096:
+            return None
+        body, _, mac = client_id[len(STATELESS_DCR_PREFIX):].partition(".")
+        expected = hmac.new(self._dcr_key(), (STATELESS_DCR_PREFIX + body).encode(), hashlib.sha256).digest()
+        try:
+            if not hmac.compare_digest(unb64url(mac), expected):
+                return None
+            data = json.loads(unb64url(body))
+        except (ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(data, dict) or data.get("h") != host_key:
+            return None
+        uris = data.get("r")
+        if not isinstance(uris, list) or not uris or not all(isinstance(u, str) and redirect_allowed(u) for u in uris):
+            return None
+        name = data.get("n") if isinstance(data.get("n"), str) else None
+        return Client(client_id, uris, name, "dcr")
+
+    def _host_key_of(self, ref: TenantRef) -> str | None:
+        if ref.host_key is not None:
+            return ref.host_key
+        tenant = self.registry.get(ref.site_id)
+        return tenant.host_key if tenant is not None else None
+
+    def _known_client(self, ref: TenantRef, client_id: str) -> Client | None:
+        """Registered (DB) or stateless DCR client usable at this ref (token / revoke endpoints)."""
+        if client_id.startswith(STATELESS_DCR_PREFIX):
+            return self._stateless_client(client_id, self._host_key_of(ref))
+        return self._load_client(ref.site_id, client_id)
+
+    async def stateless_register(self, request: Request, host_key: str) -> Response:
+        meta = await self._client_metadata(request)
+        if isinstance(meta, Response):
+            return meta
+        uris, name, grants = meta
+        client = Client(self.stateless_client_id(host_key, uris, name and name[:100]), uris, name and name[:100], "dcr")
+        return self._dcr_response(client, grants)
 
     def _save_client(self, site: str, client: Client) -> None:
         with self.registry._connect() as conn:
@@ -725,9 +911,12 @@ class OAuthServer:
             ).fetchone()
         return Client(row[0], json.loads(row[1]), row[2], row[3]) if row else None
 
-    async def _client(self, site: str, client_id: str) -> Client | None:
+    async def _client(self, ref: TenantRef, client_id: str) -> Client | None:
+        site = ref.site_id
         if not client_id:
             return None
+        if client_id.startswith(STATELESS_DCR_PREFIX):
+            return self._stateless_client(client_id, self._host_key_of(ref))
         if "://" not in client_id:
             client = self._load_client(site, client_id)
             return client if client is not None and client.source == "dcr" else None
@@ -767,13 +956,13 @@ class OAuthServer:
 
     async def authorize(self, request: Request) -> Response:
         self._purge()
-        site = request.path_params["site"]
-        found = self.tenant(site)
+        found = self._found(request)
         if not found:
             return _page("unknown site", 404)
-        tenant, secret = found
+        ref, tenant, auth = found
+        site = ref.site_id
         q = request.query_params
-        client = await self._client(site, q.get("client_id", ""))
+        client = await self._client(ref, q.get("client_id", ""))
         if client is None:
             return _page("invalid client_id", 400)
         redirect_uri = q.get("redirect_uri", "")
@@ -782,15 +971,15 @@ class OAuthServer:
         client_state = q.get("state")
 
         def fail(error: str, desc: str) -> Response:
-            return self._to_client(redirect_uri, site, client_state, error=error, error_description=desc)
+            return self._to_client(redirect_uri, ref, client_state, error=error, error_description=desc)
 
         if q.get("response_type") != "code":
             return fail("unsupported_response_type", "response_type must be code")
         challenge = q.get("code_challenge", "")
         if q.get("code_challenge_method") != "S256" or not re.fullmatch(r"[A-Za-z0-9_-]{43}", challenge):
             return fail("invalid_request", "PKCE S256 code_challenge required")
-        if q.get("resource") != self.resource(site):
-            return fail("invalid_target", "resource must be " + self.resource(site))
+        if q.get("resource") != self.resource(ref):
+            return fail("invalid_target", "resource must be " + self.resource(ref))
         requested = (q.get("scope") or " ".join(SCOPES)).split()
         if not set(requested) <= set(SCOPES) | {"offline_access"}:
             return fail("invalid_scope", "unknown scope")
@@ -804,17 +993,17 @@ class OAuthServer:
             redirect_uri=redirect_uri,
             client_state=client_state,
             code_challenge=challenge,
-            resource=self.resource(site),
+            resource=self.resource(ref),
             scope=" ".join(requested),
             bind=bind,
             exp=time.time() + REQUEST_TTL,
+            base_path=ref.base_path,
         )
         self.requests[state] = req
-        signed = sign_message(
-            secret,
+        signed = auth.sign(
             {
                 "typ": "authz_req",
-                "iss": self.issuer(site),
+                "iss": self.issuer(ref),
                 "aud": tenant.moodle_url,
                 "site": site,
                 "state": state,
@@ -822,7 +1011,7 @@ class OAuthServer:
                 "client_host": urlsplit(client.client_id).hostname if client.source == "cimd" else None,
                 "redirect_host": urlsplit(redirect_uri).hostname,
                 "scope": req.scope,
-                "callback": f"{self.issuer(site)}/oauth/callback",
+                "callback": f"{self.issuer(ref)}/oauth/callback",
                 "exp": int(req.exp),
             },
         )
@@ -833,7 +1022,7 @@ class OAuthServer:
             COOKIE,
             bind,
             max_age=REQUEST_TTL,
-            path=f"/t/{site}/oauth/",
+            path=f"{ref.base_path}/oauth/",
             secure=self.public_url.startswith("https://"),
             httponly=True,
             samesite="lax",
@@ -852,42 +1041,46 @@ class OAuthServer:
             return f"{client.client_name or host} — {host}" if client.client_name else host
         return client.client_name or urlsplit(redirect_uri).hostname or "client"
 
-    def _to_client(self, redirect_uri: str, site: str, state: str | None, **params: str) -> Response:
-        params = {**params, "iss": self.issuer(site)}
+    def _to_client(self, redirect_uri: str, ref: TenantRef | str, state: str | None, **params: str) -> Response:
+        ref = _as_ref(ref)
+        params = {**params, "iss": self.issuer(ref)}
         if state is not None:
             params["state"] = state
         sep = "&" if "?" in redirect_uri else "?"
         response = RedirectResponse(redirect_uri + sep + urlencode(params), 302)
-        response.delete_cookie(COOKIE, path=f"/t/{site}/oauth/")
+        response.delete_cookie(COOKIE, path=f"{ref.base_path}/oauth/")
         return response
 
-    async def _post(self, url: str, assertion: str) -> httpx.Response | None:
+    async def _post(self, tenant: Tenant, url: str, assertion: str) -> httpx.Response | None:
         try:
-            async with httpx.AsyncClient(timeout=10, follow_redirects=False, transport=self.transport) as client:
+            async with httpx.AsyncClient(
+                timeout=10, follow_redirects=False, transport=self.transport_for(tenant), trust_env=False
+            ) as client:
                 return await client.post(url, data={"assertion": assertion})
         except httpx.HTTPError as exc:
-            logger.warning("back channel failed: %s", type(exc).__name__)
+            logger.warning("back channel failed site=%s: %s", tenant.site_id, type(exc).__name__)
             return None
 
     async def callback(self, request: Request) -> Response:
         self._purge()
-        site = request.path_params["site"]
-        found = self.tenant(site)
+        found = self._found(request)
         req = self.requests.pop(request.query_params.get("state", ""), None)
-        if not found or req is None or req.site != site or req.exp < time.time():
+        if not found or req is None or req.site != found[0].site_id or req.exp < time.time():
+            return _page("unknown or expired request; start again from Claude", 400)
+        ref, tenant, auth = found
+        site = ref.site_id
+        if req.base_path != ref.base_path:
             return _page("unknown or expired request; start again from Claude", 400)
         if not hmac.compare_digest(request.cookies.get(COOKIE, ""), req.bind):
             return _page("this sign-in was started in another browser; start again from Claude", 400)
-        tenant, secret = found
         if request.query_params.get("error"):
-            return self._to_client(req.redirect_uri, site, req.client_state, error="access_denied",
+            return self._to_client(req.redirect_uri, ref, req.client_state, error="access_denied",
                                    error_description="the user denied the request in Moodle")
         code = request.query_params.get("code", "")
-        assertion = sign_message(
-            secret,
+        assertion = auth.sign(
             {
                 "typ": "exchange",
-                "iss": self.issuer(site),
+                "iss": self.issuer(ref),
                 "aud": tenant.moodle_url,
                 "site": site,
                 "code": code,
@@ -896,7 +1089,7 @@ class OAuthServer:
                 "exp": _now() + BACKCHANNEL_TTL,
             },
         )
-        resp = await self._post(f"{tenant.moodle_url}/local/ubionai/oauth/exchange.php", assertion)
+        resp = await self._post(tenant, f"{tenant.moodle_url}/local/ubionai/oauth/exchange.php", assertion)
         try:
             data = resp.json() if resp is not None and resp.status_code == 200 else None
         except ValueError:
@@ -916,15 +1109,20 @@ class OAuthServer:
                     reason = None
             logger.warning("exchange failed site=%s status=%s reason=%s", site,
                            resp.status_code if resp is not None else None, reason)
-            return self._to_client(req.redirect_uri, site, req.client_state, error="access_denied",
+            return self._to_client(req.redirect_uri, ref, req.client_state, error="access_denied",
                                    error_description="Moodle did not issue a token")
         userid, tokenid = data["userid"], data["tokenid"]
         problem = await self._check_user_token(tenant, data["wstoken"], userid)
         if problem:
             logger.warning("user token refused site=%s userid=%s: %s", site, userid, problem)
-            await self._revoke_moodle(site, userid, tokenid)
-            return self._to_client(req.redirect_uri, site, req.client_state, error="access_denied",
+            await self._revoke_moodle(site, userid, tokenid, ref)
+            return self._to_client(req.redirect_uri, ref, req.client_state, error="access_denied",
                                    error_description=problem)
+        if self.teacher_limit_reached(tenant, userid):
+            logger.warning("teacher limit reached site=%s limit=%s", site, self.limits.max_teachers)
+            await self._revoke_moodle(site, userid, tokenid, ref)
+            return self._to_client(req.redirect_uri, ref, req.client_state, error="access_denied",
+                                   error_description=TEACHER_LIMIT_ERROR)
         grant_id = secrets.token_urlsafe(16)
         ct = seal(self.kek, data["wstoken"].encode(), site, _user_field(grant_id, userid), moodle_url=tenant.moodle_url)
         code_out = secrets.token_urlsafe(32)
@@ -942,11 +1140,13 @@ class OAuthServer:
             valid_until=min(data["validuntil"], _now() + self.refresh_ttl),
             exp=time.time() + CODE_TTL,
         )
-        return self._to_client(req.redirect_uri, site, req.client_state, code=code_out)
+        return self._to_client(req.redirect_uri, ref, req.client_state, code=code_out)
 
     async def _check_user_token(self, tenant: Tenant, wstoken: str, userid: int) -> str | None:
         """G8: refuse site-admin tokens and tokens of any service other than ubionai_user."""
-        client = MoodleClient(ws_endpoint(tenant.moodle_url), wstoken, timeout=10, transport=self.transport)
+        client = MoodleClient(
+            ws_endpoint(tenant.moodle_url), wstoken, timeout=10, transport=self.transport_for(tenant)
+        )
         try:
             info = await client.call("core_webservice_get_site_info")
         except MoodleError as exc:
@@ -963,16 +1163,15 @@ class OAuthServer:
             return "token is not limited to the ubionai_user service"
         return None
 
-    async def _revoke_moodle(self, site: str, userid: int, tokenid: int) -> bool:
+    async def _revoke_moodle(self, site: str, userid: int, tokenid: int, ref: TenantRef | None = None) -> bool:
         found = self.tenant(site)
         if not found:
             return False
-        tenant, secret = found
-        assertion = sign_message(
-            secret,
+        tenant, auth = found
+        assertion = auth.sign(
             {
                 "typ": "revoke",
-                "iss": self.issuer(site),
+                "iss": self.issuer(ref or site),
                 "aud": tenant.moodle_url,
                 "site": site,
                 "userid": userid,
@@ -981,7 +1180,7 @@ class OAuthServer:
                 "exp": _now() + BACKCHANNEL_TTL,
             },
         )
-        resp = await self._post(f"{tenant.moodle_url}/local/ubionai/oauth/revoke.php", assertion)
+        resp = await self._post(tenant, f"{tenant.moodle_url}/local/ubionai/oauth/revoke.php", assertion)
         ok = resp is not None and resp.status_code == 200
         if not ok:
             logger.warning("moodle revoke failed site=%s userid=%s", site, userid)
@@ -1027,27 +1226,34 @@ class OAuthServer:
             conn.execute("UPDATE oauth_tokens SET used_at = ? WHERE grant_id = ? AND used_at IS NULL",
                          (_now(), grant.grant_id))
         if cur.rowcount:
-            await self._revoke_moodle(grant.site_id, grant.moodle_userid, grant.moodle_tokenid)
+            await self._revoke_moodle(grant.site_id, grant.moodle_userid, grant.moodle_tokenid, self._ref_for_grant(grant))
 
     async def token(self, request: Request) -> Response:
         self._purge()
-        site = self._site(request)
-        if not site:
+        ref = self._site(request)
+        if not ref:
             return _oauth_error("invalid_request", "unknown site", 404)
+        site = ref.site_id
         if not request.headers.get("content-type", "").startswith("application/x-www-form-urlencoded"):
             return _oauth_error("invalid_request", "form-urlencoded body required")
         form = await request.form()
         grant_type = form.get("grant_type")
         client_id = str(form.get("client_id") or "")
-        if not client_id or self._load_client(site, client_id) is None:
+        if not client_id or self._known_client(ref, client_id) is None:
             return _oauth_error("invalid_client", "unknown client", 401)
         resource = form.get("resource")
-        if resource is not None and resource != self.resource(site):
+        if resource is not None and resource != self.resource(ref):
             return _oauth_error("invalid_target", "resource mismatch")
 
         if grant_type == "authorization_code":
             code = self.codes.pop(_hash(str(form.get("code") or "")), None)
-            if code is None or code.site != site or code.exp < time.time() or code.client_id != client_id:
+            if (
+                code is None
+                or code.site != site
+                or code.exp < time.time()
+                or code.client_id != client_id
+                or code.resource != self.resource(ref)
+            ):
                 if code is not None:
                     self._spawn(self._revoke_moodle(code.site, code.moodle_userid, code.moodle_tokenid))
                 return _oauth_error("invalid_grant", "invalid code")
@@ -1060,6 +1266,11 @@ class OAuthServer:
                 # The code is burnt either way; its Moodle token must not linger.
                 self._spawn(self._revoke_moodle(code.site, code.moodle_userid, code.moodle_tokenid))
                 return _oauth_error("invalid_grant", "redirect_uri or PKCE verification failed")
+            tenant = self.registry.get(site)
+            if tenant is not None and self.teacher_limit_reached(tenant, code.moodle_userid):
+                # Another new teacher got the last seat between callback and token.
+                self._spawn(self._revoke_moodle(code.site, code.moodle_userid, code.moodle_tokenid))
+                return _oauth_error("invalid_grant", TEACHER_LIMIT_ERROR)
             with self.registry._connect() as conn:
                 conn.execute(
                     "INSERT INTO oauth_grants (grant_id, site_id, moodle_userid, client_id, scope, resource,"
@@ -1083,7 +1294,7 @@ class OAuthServer:
             if found is None:
                 return _oauth_error("invalid_grant", "invalid refresh token")
             grant, revoked_at = found
-            if grant.site_id != site or grant.client_id != client_id:
+            if grant.site_id != site or grant.client_id != client_id or grant.resource != self.resource(ref):
                 return _oauth_error("invalid_grant", "invalid refresh token")
             with self.registry._connect() as conn:
                 claimed = conn.execute(
@@ -1101,9 +1312,10 @@ class OAuthServer:
         return _oauth_error("unsupported_grant_type", "authorization_code or refresh_token")
 
     async def revoke(self, request: Request) -> Response:
-        site = self._site(request)
-        if not site:
+        ref = self._site(request)
+        if not ref:
             return _oauth_error("invalid_request", "unknown site", 404)
+        site = ref.site_id
         form = await request.form()
         token_hash = _hash(str(form.get("token") or ""))
         with self.registry._connect() as conn:

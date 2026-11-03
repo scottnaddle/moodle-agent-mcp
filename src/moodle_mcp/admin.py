@@ -97,11 +97,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--assignment-title-heuristic", choices=ASSIGNMENT_TITLE_HEURISTICS
     )
 
+    # Operator switch for self-registered sites too (§8.3 #1): a disabled site gets no OAuth, its
+    # tokens stop working and re-registration cannot re-enable it (403 host_blocked).
     disable = sub.add_parser("disable", help="disable a tenant")
-    disable.add_argument("--site-id", required=True)
+    disable_target = disable.add_mutually_exclusive_group(required=True)
+    disable_target.add_argument("--site-id")
+    disable_target.add_argument("--host", help="site by host_key (e.g. lms.example.ac.kr/moodle)")
 
     enable = sub.add_parser("enable", help="enable a tenant")
-    enable.add_argument("--site-id", required=True)
+    enable_target = enable.add_mutually_exclusive_group(required=True)
+    enable_target.add_argument("--site-id")
+    enable_target.add_argument("--host")
 
     listing = sub.add_parser("list", help="list tenants (metadata only)")
     listing.add_argument("--json", action="store_true")
@@ -127,6 +133,9 @@ def _metadata(tenant) -> dict[str, object]:
         "site_id": tenant.site_id,
         "moodle_url": tenant.moodle_url,
         "status": tenant.status,
+        "origin": tenant.origin,
+        "tier": tenant.tier,
+        "host_key": tenant.host_key,
         "has_litellm": tenant.litellm_ct is not None,
         "kek_id": tenant.kek_id,
         "pseudonymize": tenant.pseudonymize,
@@ -200,14 +209,17 @@ def main(argv: list[str] | None = None) -> int:
             print(f"rotated site={args.site_id}")
             return 0
 
-        if args.command == "disable":
-            registry.set_status(args.site_id, "disabled")
-            print(f"disabled site={args.site_id}")
-            return 0
-
-        if args.command == "enable":
-            registry.set_status(args.site_id, "active")
-            print(f"enabled site={args.site_id}")
+        if args.command in ("disable", "enable"):
+            site_id = args.site_id
+            if args.host is not None:
+                tenant = registry.get_by_host_key(args.host)
+                if tenant is None:
+                    print("error: no tenant with that host_key", file=sys.stderr)
+                    return 1
+                site_id = tenant.site_id
+            status = "disabled" if args.command == "disable" else "active"
+            registry.set_status(site_id, status)
+            print(f"{args.command}d site={site_id}")
             return 0
 
         if args.command == "list":
