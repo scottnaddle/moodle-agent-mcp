@@ -7,10 +7,15 @@ services:
       UBIONAI_HUB_PUBLIC_URL: https://hub-staging.ubion.global
       UBIONAI_HUB_EGRESS_IP: ${UBIONAI_HUB_EGRESS_IP:-}
       UBIONAI_HUB_LITELLM_URL: http://litellm:4000
+      # Per-teacher OAuth (Easy Connect trial). On for a site only when
+      # /opt/ubionai-hub/secrets/tenants/<site>/oauth.secret exists (see deploy/hub/SPIKE-OAUTH.md).
+      UBIONAI_HUB_TENANT_SECRETS_DIR: /run/secrets/tenants
       MCP_PORT: 8090
       LOG_LEVEL: INFO
     secrets: [kek.key]
-    volumes: [hub-data:/data]
+    volumes:
+      - hub-data:/data
+      - /opt/ubionai-hub/secrets/tenants:/run/secrets/tenants:ro
     ports: ["127.0.0.1:8090:8090"]
     networks: [ubionai-staging]
     mem_limit: 512m

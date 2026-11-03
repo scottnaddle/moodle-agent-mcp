@@ -89,7 +89,7 @@ foreach (['webservice/rest:use', 'moodle/webservice:createtoken', 'moodle/course
           'moodle/badges:createbadge', 'moodle/badges:configurecriteria', 'moodle/badges:awardbadge'] as $cap) {
     if (get_capability_info($cap)) { assign_capability($cap, CAP_ALLOW, $roleid, $sys->id, true); }
 }
-// Allow the role to assign editingteacher/student (create_course enrols the bot as editingteacher).
+// Allow the role to assign editingteacher/teacher/student.
 foreach (['editingteacher', 'teacher', 'student'] as $target) {
     $tid = $DB->get_field('role', 'id', ['shortname' => $target]);
     if ($tid && !$DB->record_exists('role_allow_assign', ['roleid' => $roleid, 'allowassign' => $tid])) { core_role_set_assign_allowed($roleid, $tid); }
@@ -101,10 +101,10 @@ cli_writeln("[ok] role $roleshort assigned to $username at system context");
 // 5. External service + functions.
 $functions = [
   'core_webservice_get_site_info','core_course_get_courses','core_course_get_contents','core_course_get_categories',
-  'core_course_create_courses','core_course_update_courses','core_course_edit_module','core_course_edit_section',
+  'core_course_update_courses','core_course_edit_module','core_course_edit_section',
   'core_courseformat_create_module','core_courseformat_update_course','core_enrol_get_enrolled_users',
   'core_user_get_users_by_field','core_files_upload','core_grades_update_grades','core_calendar_get_calendar_events',
-  'enrol_manual_enrol_users','gradereport_user_get_grade_items','gradereport_grader_get_users_in_report',
+  'gradereport_user_get_grade_items','gradereport_grader_get_users_in_report',
   'mod_assign_get_assignments','mod_assign_get_submissions','mod_assign_get_grades','mod_assign_save_grade','mod_assign_save_grades',
   'mod_quiz_get_quizzes_by_courses','mod_quiz_get_user_attempts','mod_quiz_get_attempt_review','mod_quiz_add_random_questions',
   'mod_forum_add_discussion','mod_forum_get_forum_discussions','mod_forum_get_discussion_posts',

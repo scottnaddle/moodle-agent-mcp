@@ -75,6 +75,10 @@ def test_add_list_rotate_disable_enable_delete(admin_env, capsys):
             "site_id": "site-a",
             "moodle_url": "https://a.test",
             "status": "active",
+            "origin": "operator",
+            "tier": "standard",
+            "host_key": "a.test",
+            "linked": False,
             "has_litellm": True,
             "kek_id": load_kek(kek_file).kek_id,
             "pseudonymize": True,
@@ -106,6 +110,12 @@ def test_add_list_rotate_disable_enable_delete(admin_env, capsys):
     assert registry.verify_bearer("site-a", bearer_a2) is None
     assert main(["enable", "--site-id", "site-a"]) == 0
     assert registry.verify_bearer("site-a", bearer_a2) is not None
+    # The same switch by host_key (how operators find self-registered sites).
+    assert main(["disable", "--host", "a.test"]) == 0
+    assert registry.get("site-a").status == "disabled"
+    assert main(["enable", "--host", "a.test"]) == 0
+    assert registry.get("site-a").status == "active"
+    assert main(["disable", "--host", "unknown.test"]) == 1
 
     assert main(["delete", "--site-id", "site-a"]) == 1
     assert registry.get("site-a") is not None

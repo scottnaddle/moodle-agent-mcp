@@ -39,7 +39,6 @@ Token values are never logged or included in error messages. See `.env.example`;
 | `get_assignment_grades(assignment_ids)` | `mod_assign_get_grades` |
 | `list_categories()` | `core_course_get_categories` |
 | `list_forum_discussions(forum_id)` | `mod_forum_get_forum_discussions` + `mod_forum_get_discussion_posts` per discussion |
-| `create_course(...)` **WRITE, preview** | `core_course_create_courses` + `enrol_manual_enrol_users` |
 | `create_assignment(course_id, section, name, ...)` **WRITE, preview** | `local_ubionai_create_module` (assign) |
 | `create_quiz(course_id, section, name, ...)` **WRITE, preview** | `local_ubionai_create_module` (quiz) |
 | `create_forum(course_id, section, name, ...)` **WRITE, preview** | `local_ubionai_create_module` (forum) |
