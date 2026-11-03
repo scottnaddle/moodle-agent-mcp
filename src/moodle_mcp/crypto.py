@@ -16,9 +16,11 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 FIELD_MOODLE_TOKEN = "moodle_token"
 FIELD_LITELLM_KEY = "litellm_key"
+FIELD_ADMIN_CONTACT = "admin_contact"
 
 PURPOSE_PSEUDONYM_HMAC = "pseudonym-hmac"
 PURPOSE_PSEUDONYM_MAP = "pseudonym-map"
+PURPOSE_DCR_STATELESS = "dcr-stateless"
 
 _HKDF_SALT = b"ubionai-hub/hkdf/v1"
 

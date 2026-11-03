@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import os
 import re
 import secrets
@@ -19,6 +20,7 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from .crypto import (
+    FIELD_ADMIN_CONTACT,
     FIELD_LITELLM_KEY,
     FIELD_MOODLE_TOKEN,
     PURPOSE_PSEUDONYM_MAP,
@@ -28,6 +30,9 @@ from .crypto import (
     open_,
     seal,
 )
+from .hostkey import HostKeyError, allowed_ports_from_env, normalize_site_url
+
+logger = logging.getLogger(__name__)
 
 SITE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
 
@@ -47,27 +52,54 @@ _PMAP_NONCE_LEN = 12
 # Assignment-title name heuristic per tenant (see pseudonym.HEURISTIC_MODES).
 ASSIGNMENT_TITLE_HEURISTICS = ("full", "title", "off")
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS meta (
-  schema_version INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS tenants (
+SCHEMA_VERSION = 6
+TENANT_STATUSES = ("active", "pending", "disabled")
+
+_TENANTS_V6_COLUMNS = """
   site_id      TEXT PRIMARY KEY CHECK (site_id GLOB '[a-z0-9]*'
                  AND length(site_id) BETWEEN 2 AND 63),
   moodle_url   TEXT NOT NULL,
-  token_ct     BLOB NOT NULL,
+  token_ct     BLOB,
   litellm_ct   BLOB,
-  bearer_hash  BLOB NOT NULL UNIQUE,
+  bearer_hash  BLOB UNIQUE,
   kek_id       TEXT NOT NULL,
   status       TEXT NOT NULL DEFAULT 'active'
-               CHECK (status IN ('active','disabled')),
+               CHECK (status IN ('active','pending','disabled')),
   pseudonymize INTEGER NOT NULL DEFAULT 1
                CHECK (pseudonymize IN (0,1)),
   assignment_title_heuristic TEXT NOT NULL DEFAULT 'title'
                CHECK (assignment_title_heuristic IN ('full','title','off')),
   created_at   INTEGER NOT NULL,
-  updated_at   INTEGER NOT NULL
+  updated_at   INTEGER NOT NULL,
+  host_key     TEXT UNIQUE,
+  origin       TEXT NOT NULL DEFAULT 'operator'
+               CHECK (origin IN ('operator','self_registered')),
+  tier         TEXT NOT NULL DEFAULT 'standard' CHECK (tier IN ('limited','standard')),
+  auth_mode    TEXT NOT NULL DEFAULT 'legacy_file'
+               CHECK (auth_mode IN ('legacy_file','shared_secret','signature')),
+  site_identifier_hash BLOB,
+  plugin_version INTEGER,
+  moodle_release TEXT,
+  contact_ct   BLOB,
+  consent_version TEXT,
+  consent_at   INTEGER,
+  last_verified_at INTEGER,
+  secret_seq   INTEGER NOT NULL DEFAULT 0,
+  CHECK (origin = 'operator' OR (token_ct IS NULL AND bearer_hash IS NULL)),
+  CHECK (origin = 'self_registered' OR (token_ct IS NOT NULL AND bearer_hash IS NOT NULL))
+"""
+
+# Columns that exist before v6, copied by the v6 table rebuild.
+_TENANTS_V5_COLUMNS = (
+    "site_id, moodle_url, token_ct, litellm_ct, bearer_hash, kek_id, status, pseudonymize,"
+    " assignment_title_heuristic, created_at, updated_at"
+)
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (
+  schema_version INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS tenants (""" + _TENANTS_V6_COLUMNS + """);
 CREATE TABLE IF NOT EXISTS reg_codes (
   code_hash  BLOB PRIMARY KEY,
   site_id    TEXT NOT NULL,
@@ -84,8 +116,43 @@ CREATE TABLE IF NOT EXISTS pseudonym_map (
   expires_at  INTEGER NOT NULL,
   PRIMARY KEY (site_id, placeholder)
 );
-INSERT INTO meta(schema_version) SELECT 4 WHERE NOT EXISTS (SELECT 1 FROM meta);
+INSERT INTO meta(schema_version) SELECT 6 WHERE NOT EXISTS (SELECT 1 FROM meta);
 """
+
+# Schema v6 (registration contract §3.2): tenants without a site token / static bearer
+# (self-registered), host_key routing, tier, auth_mode. Operator rows keep their token + bearer.
+_SCHEMA_V6_EXTRA = """
+CREATE TABLE IF NOT EXISTS site_credentials (
+  site_id      TEXT NOT NULL,
+  version      INTEGER NOT NULL,
+  kind         TEXT NOT NULL CHECK (kind IN ('shared_secret')),
+  secret_hash  BLOB NOT NULL,
+  mac_key_ct   BLOB NOT NULL,
+  kek_id       TEXT NOT NULL,
+  state        TEXT NOT NULL CHECK (state IN ('pending','current','retired')),
+  created_at   INTEGER NOT NULL,
+  confirmed_at INTEGER,
+  expires_at   INTEGER,
+  PRIMARY KEY (site_id, version)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS site_credentials_one_current
+  ON site_credentials(site_id) WHERE state = 'current';
+CREATE UNIQUE INDEX IF NOT EXISTS site_credentials_one_pending
+  ON site_credentials(site_id) WHERE state = 'pending';
+CREATE TABLE IF NOT EXISTS site_registrations (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  host_key         TEXT NOT NULL,
+  site_id          TEXT,
+  nonce_hash       BLOB UNIQUE,
+  client_ip_prefix TEXT,
+  outcome          TEXT NOT NULL,
+  error            TEXT,
+  plugin_version   INTEGER,
+  created_at       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS site_registrations_host ON site_registrations(host_key, created_at);
+"""
+
 
 
 class TenantError(Exception):
@@ -108,8 +175,8 @@ class RegCodeError(TenantError):
 class Tenant:
     site_id: str
     moodle_url: str
-    bearer_hash: bytes
-    token_ct: bytes
+    bearer_hash: bytes | None
+    token_ct: bytes | None
     litellm_ct: bytes | None
     kek_id: str
     status: str
@@ -117,6 +184,20 @@ class Tenant:
     updated_at: int
     pseudonymize: bool = True
     assignment_title_heuristic: str = "title"
+    host_key: str | None = None
+    origin: str = "operator"
+    tier: str = "standard"
+    auth_mode: str = "legacy_file"
+    site_identifier_hash: bytes | None = None
+    plugin_version: int | None = None
+    moodle_release: str | None = None
+    consent_version: str | None = None
+    consent_at: int | None = None
+    last_verified_at: int | None = None
+
+    @property
+    def self_registered(self) -> bool:
+        return self.origin == "self_registered"
 
 
 def normalize_moodle_url(url: str, allow_http: bool = False) -> str:
@@ -141,6 +222,14 @@ def normalize_moodle_url(url: str, allow_http: bool = False) -> str:
         netloc = f"{host}:{port}"
     path = parts.path.rstrip("/")
     return urlunsplit((scheme, netloc, path, "", ""))
+
+
+def operator_host_key(moodle_url: str) -> str | None:
+    """host_key of an operator tenant's Moodle URL, or None (http, IP literal, internal name…)."""
+    try:
+        return normalize_site_url(moodle_url, allowed_ports_from_env()).host_key
+    except HostKeyError:
+        return None
 
 
 def ws_endpoint(moodle_url: str) -> str:
@@ -193,14 +282,56 @@ class Registry:
                 )
             row = conn.execute("SELECT schema_version FROM meta").fetchone()
             if row is None:
-                conn.execute("INSERT INTO meta(schema_version) VALUES (4)")
+                conn.execute("INSERT INTO meta(schema_version) VALUES (?)", (SCHEMA_VERSION,))
             else:
                 if row[0] < 3:
                     registry._migrate_aad(conn)
                     conn.execute("UPDATE meta SET schema_version = 3")
                 if row[0] < 4:
                     conn.execute("UPDATE meta SET schema_version = 4")
+            conn.commit()
+            columns = {info[1] for info in conn.execute("PRAGMA table_info(tenants)")}
+            if "host_key" not in columns:
+                registry._migrate_v6(conn)
+            conn.executescript(_SCHEMA_V6_EXTRA)
+            conn.execute(
+                "UPDATE meta SET schema_version = ? WHERE schema_version < ?",
+                (SCHEMA_VERSION, SCHEMA_VERSION),
+            )
         return registry
+
+    def _migrate_v6(self, conn: sqlite3.Connection) -> None:
+        """Rebuild ``tenants`` (SQLite cannot drop NOT NULL with ALTER) in one transaction.
+
+        Existing rows become ``origin='operator'``, ``tier='standard'``, ``auth_mode='legacy_file'``;
+        ``host_key`` is computed from ``moodle_url`` and left NULL when it is not a valid public
+        https host key or when two tenants would share it (logged for the operator).
+        """
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute("CREATE TABLE tenants_v6 (" + _TENANTS_V6_COLUMNS + ")")
+            conn.execute(
+                f"INSERT INTO tenants_v6 ({_TENANTS_V5_COLUMNS}) SELECT {_TENANTS_V5_COLUMNS} FROM tenants"
+            )
+            conn.execute("DROP TABLE tenants")
+            conn.execute("ALTER TABLE tenants_v6 RENAME TO tenants")
+            keys: dict[str, list[str]] = {}
+            for site_id, moodle_url in conn.execute("SELECT site_id, moodle_url FROM tenants").fetchall():
+                host_key = operator_host_key(moodle_url)
+                if host_key is None:
+                    logger.warning("schema v6: no host_key for site=%s (not a public https URL)", site_id)
+                    continue
+                keys.setdefault(host_key, []).append(site_id)
+            for host_key, sites in keys.items():
+                if len(sites) > 1:
+                    logger.warning("schema v6: host_key %s shared by %s; left NULL", host_key, ",".join(sites))
+                    continue
+                conn.execute("UPDATE tenants SET host_key = ? WHERE site_id = ?", (host_key, sites[0]))
+            conn.execute("UPDATE meta SET schema_version = ?", (SCHEMA_VERSION,))
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
     def _migrate_aad(self, conn: sqlite3.Connection) -> None:
         """Re-seal legacy rows so the tenant Moodle URL is bound into the token AAD."""
@@ -264,13 +395,25 @@ class Registry:
             updated_at=row[8],
             pseudonymize=bool(row[9]),
             assignment_title_heuristic=row[10],
+            host_key=row[11],
+            origin=row[12],
+            tier=row[13],
+            auth_mode=row[14],
+            site_identifier_hash=row[15],
+            plugin_version=row[16],
+            moodle_release=row[17],
+            consent_version=row[18],
+            consent_at=row[19],
+            last_verified_at=row[20],
         )
 
     @staticmethod
     def _select_columns() -> str:
         return (
             "site_id, moodle_url, token_ct, litellm_ct, bearer_hash, kek_id, "
-            "status, created_at, updated_at, pseudonymize, assignment_title_heuristic"
+            "status, created_at, updated_at, pseudonymize, assignment_title_heuristic, "
+            "host_key, origin, tier, auth_mode, site_identifier_hash, plugin_version, "
+            "moodle_release, consent_version, consent_at, last_verified_at"
         )
 
     def add(
@@ -294,12 +437,18 @@ class Registry:
             if litellm_key is not None
             else None
         )
+        host_key = operator_host_key(url)
         try:
             with self._connect() as conn:
+                if host_key is not None and conn.execute(
+                    "SELECT 1 FROM tenants WHERE host_key = ?", (host_key,)
+                ).fetchone():
+                    logger.warning("host_key %s already used; site=%s gets none", host_key, site_id)
+                    host_key = None
                 conn.execute(
                     "INSERT INTO tenants (site_id, moodle_url, token_ct, litellm_ct, bearer_hash,"
-                    " kek_id, status, pseudonymize, created_at, updated_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)",
+                    " kek_id, status, pseudonymize, created_at, updated_at, host_key)"
+                    " VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)",
                     (
                         site_id,
                         url,
@@ -310,10 +459,105 @@ class Registry:
                         int(pseudonymize),
                         now,
                         now,
+                        host_key,
                     ),
                 )
         except sqlite3.IntegrityError:
             raise DuplicateSite("site already exists") from None
+
+    def add_self_registered(
+        self,
+        site_id: str,
+        moodle_url: str,
+        host_key: str,
+        *,
+        status: str,
+        site_identifier_hash: bytes | None,
+        plugin_version: int,
+        moodle_release: str,
+        consent_version: str,
+        consent_at: int,
+        contact: bytes | None = None,
+    ) -> Tenant:
+        """Self-registered tenant: tier limited, no site token, no static bearer (contract §3.2)."""
+        if not SITE_ID_RE.fullmatch(site_id):
+            raise TenantError("invalid site_id")
+        if status not in ("active", "pending"):
+            raise TenantError("invalid status")
+        now = _now()
+        contact_ct = (
+            seal(self._kek, contact, site_id, FIELD_ADMIN_CONTACT, moodle_url=moodle_url)
+            if contact is not None
+            else None
+        )
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT INTO tenants (site_id, moodle_url, token_ct, litellm_ct, bearer_hash, kek_id,"
+                    " status, pseudonymize, created_at, updated_at, host_key, origin, tier, auth_mode,"
+                    " site_identifier_hash, plugin_version, moodle_release, contact_ct,"
+                    " consent_version, consent_at, last_verified_at)"
+                    " VALUES (?, ?, NULL, NULL, NULL, ?, ?, 1, ?, ?, ?, 'self_registered', 'limited',"
+                    " 'shared_secret', ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        site_id, moodle_url, self._kek.kek_id, status, now, now, host_key,
+                        site_identifier_hash, plugin_version, moodle_release, contact_ct,
+                        consent_version, consent_at, now,
+                    ),
+                )
+        except sqlite3.IntegrityError:
+            raise DuplicateSite("site or host already exists") from None
+        return self._require(site_id)
+
+    def record_verification(
+        self,
+        site_id: str,
+        *,
+        plugin_version: int,
+        moodle_release: str,
+        site_identifier_hash: bytes | None,
+        consent_version: str,
+        consent_at: int,
+        contact: bytes | None = None,
+    ) -> None:
+        """A re-registration proved control of the site again (callback verified)."""
+        tenant = self._require(site_id)
+        now = _now()
+        contact_ct = (
+            seal(self._kek, contact, site_id, FIELD_ADMIN_CONTACT, moodle_url=tenant.moodle_url)
+            if contact is not None
+            else None
+        )
+        self._update(
+            site_id,
+            "plugin_version = ?, moodle_release = ?, site_identifier_hash = ?, consent_version = ?,"
+            " consent_at = ?, contact_ct = COALESCE(?, contact_ct), last_verified_at = ?, updated_at = ?",
+            (plugin_version, moodle_release, site_identifier_hash, consent_version, consent_at,
+             contact_ct, now, now),
+        )
+
+    def get_by_host_key(self, host_key: str) -> Tenant | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                f"SELECT {self._select_columns()} FROM tenants WHERE host_key = ?", (host_key,)
+            ).fetchone()
+        return self._tenant(row) if row is not None else None
+
+    def site_identifier_elsewhere(self, site_identifier_hash: bytes, host_key: str) -> bool:
+        """Another host already registered with the same Moodle siteidentifier (cloned DB?)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM tenants WHERE site_identifier_hash = ? AND host_key IS NOT ?",
+                (site_identifier_hash, host_key),
+            ).fetchone()
+        return row is not None
+
+    def count_self_registered_since(self, since: int) -> int:
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM tenants WHERE origin = 'self_registered' AND created_at >= ?",
+                (since,),
+            ).fetchone()[0]
 
     def get(self, site_id: str) -> Tenant | None:
         with self._connect() as conn:
@@ -324,14 +568,14 @@ class Registry:
 
     def verify_bearer(self, site_id: str, bearer: str) -> Tenant | None:
         tenant = self.get(site_id)
-        if tenant is None or tenant.status != "active":
+        if tenant is None or tenant.status != "active" or tenant.bearer_hash is None:
             return None
         if not hmac.compare_digest(tenant.bearer_hash, _hash_bearer(bearer)):
             return None
         return tenant
 
     def set_status(self, site_id: str, status: str) -> None:
-        if status not in ("active", "disabled"):
+        if status not in TENANT_STATUSES:
             raise TenantError("invalid status")
         self._update(site_id, "status = ?, updated_at = ?", (status, _now()))
 
@@ -523,6 +767,8 @@ class Registry:
     def delete(self, site_id: str) -> None:
         with self._connect() as conn:
             conn.execute("DELETE FROM pseudonym_map WHERE site_id = ?", (site_id,))
+            conn.execute("DELETE FROM site_credentials WHERE site_id = ?", (site_id,))
+            conn.execute("DELETE FROM site_registrations WHERE site_id = ?", (site_id,))
             cur = conn.execute("DELETE FROM tenants WHERE site_id = ?", (site_id,))
             if cur.rowcount == 0:
                 raise TenantNotFound("site not found")
@@ -540,6 +786,8 @@ class Registry:
         return {row[0] for row in rows}
 
     def moodle_token(self, tenant: Tenant) -> bytearray:
+        if tenant.token_ct is None:
+            raise DecryptError("tenant has no site token")
         return open_(
             self._kek,
             tenant.token_ct,

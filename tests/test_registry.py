@@ -137,7 +137,7 @@ def test_assignment_title_heuristic_roundtrip(tmp_path):
     assert registry.get("site-a").assignment_title_heuristic == "off"
 
 
-def test_schema_v1_migrates_to_v4(tmp_path):
+def test_schema_v1_migrates_to_v6(tmp_path):
     db = tmp_path / "old.sqlite3"
     with sqlite3.connect(db) as conn:
         conn.executescript(
@@ -172,8 +172,8 @@ def test_schema_v1_migrates_to_v4(tmp_path):
     assert tenant.pseudonymize is True
     assert tenant.assignment_title_heuristic == "title"
     with sqlite3.connect(db) as conn:
-        assert conn.execute("SELECT schema_version FROM meta").fetchone()[0] == 4
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(tenants)")}
+        assert conn.execute("SELECT schema_version FROM meta").fetchone()[0] == 6
+        columns ={row[1] for row in conn.execute("PRAGMA table_info(tenants)")}
         assert "pseudonymize" in columns
         assert "assignment_title_heuristic" in columns
         tables = {
@@ -195,7 +195,7 @@ def test_registration_codes_are_atomic_and_expire(tmp_path):
     assert registry.claim_code("not-" + unknown, now) is None
 
 
-def test_schema_v3_migrates_to_v4(tmp_path):
+def test_schema_v3_migrates_to_v6(tmp_path):
     db = tmp_path / "v3.sqlite3"
     with sqlite3.connect(db) as conn:
         conn.executescript(
@@ -225,7 +225,7 @@ def test_schema_v3_migrates_to_v4(tmp_path):
         )
     registry = Registry.open(str(db), make_kek())
     with sqlite3.connect(db) as conn:
-        assert conn.execute("SELECT schema_version FROM meta").fetchone()[0] == 4
+        assert conn.execute("SELECT schema_version FROM meta").fetchone()[0] == 6
         tables = {
             row[0]
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
