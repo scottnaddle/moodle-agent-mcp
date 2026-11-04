@@ -390,3 +390,81 @@ def test_idnumber_regressions():
         {"users": [{"id": 1, "idnumber": "ST-001", "fullname": "홍길동"}]}
     )
     assert STUDENT_ID_RE.fullmatch(users["users"][0]["idnumber"])
+
+
+def test_enrolledcourses_inside_user_not_masked_and_not_seeded():
+    p = Pseudonymizer()
+    m = p.pseudonymize_value(
+        {
+            "users": [
+                {
+                    "id": 3,
+                    "firstname": "민준",
+                    "lastname": "김",
+                    "email": "a@b.kr",
+                    "enrolledcourses": [{"id": 1, "fullname": "한국사의 이해"}],
+                }
+            ]
+        }
+    )
+    u = m["users"][0]
+    assert NAME_RE.fullmatch(u["firstname"]) and EMAIL_RE.fullmatch(u["email"])
+    assert u["enrolledcourses"][0]["fullname"] == "한국사의 이해"
+    assert p.pseudonymize("이해 중심 수업", heuristic="off") == "이해 중심 수업"
+
+
+def test_grade_items_structure_passes_user_fields_masked():
+    m = Pseudonymizer().pseudonymize_value(
+        {
+            "usergrades": [
+                {
+                    "userid": 7,
+                    "userfullname": "홍길동",
+                    "useridnumber": "ST-001",
+                    "gradeitems": [
+                        {
+                            "itemname": "중간 시험",
+                            "idnumber": "final",
+                            "gradeformatted": "85.00",
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    g = m["usergrades"][0]
+    assert NAME_RE.fullmatch(g["userfullname"]) and STUDENT_ID_RE.fullmatch(
+        g["useridnumber"]
+    )
+    assert g["gradeitems"][0] == {
+        "itemname": "중간 시험",
+        "idnumber": "final",
+        "gradeformatted": "85.00",
+    }
+
+
+def test_course_outline_labels_pass_but_names_and_free_text_masked():
+    m = Pseudonymizer().pseudonymize_value(
+        {
+            "sections": [
+                {
+                    "name": "운영체제 개론",
+                    "summary": "김민수 학생 발표",
+                    "modules": [{"name": "김민수 보충 수업"}],
+                }
+            ]
+        }
+    )
+    s = m["sections"][0]
+    assert s["name"] == "운영체제 개론"
+    assert "김민수" not in s["summary"] and "김민수" not in s["modules"][0]["name"]
+
+
+def test_course_displayname_and_categoryname_pass():
+    m = Pseudonymizer().pseudonymize_value(
+        {"courses": [{"displayname": "한국사의 이해", "categoryname": "인문대학"}]}
+    )
+    assert m["courses"][0] == {
+        "displayname": "한국사의 이해",
+        "categoryname": "인문대학",
+    }
