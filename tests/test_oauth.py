@@ -870,3 +870,9 @@ def test_signing_roundtrip_rejects_tampering():
     body, mac = token.split(".")
     assert verify_message(SECRET, body + "." + mac[:-2] + "AA", "revoke") is None
     assert verify_message(SECRET, sign_message(SECRET, {"typ": "revoke", "exp": 1}), "revoke") is None
+
+
+def test_user_service_functions_include_authoring_writes():
+    """The per-user OAuth whitelist must admit the plugin's authoring write tools."""
+    assert "local_ubionai_add_sections" in USER_SERVICE_FUNCTIONS
+    assert "local_ubionai_add_quiz_questions" in USER_SERVICE_FUNCTIONS
