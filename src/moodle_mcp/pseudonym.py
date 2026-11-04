@@ -64,13 +64,22 @@ _USER_MARKER_KEYS = frozenset(
 )
 # Names of non-user objects (courses, categories, activities) are kept as-is,
 # including from heuristic name detection, unless the object is user-like.
-_PLAIN_OBJECT_FIELDS = frozenset({"fullname", "shortname"})
+_PLAIN_OBJECT_FIELDS = frozenset(
+    {"fullname", "shortname", "displayname", "categoryname", "coursename"}
+)
+# Structural label fields of non-user objects (activities, grade items,
+# sections). Free-text fields (intro/summary/message/text) keep the full
+# heuristic since student names may appear inside them.
+_LABEL_FIELDS = frozenset({"name", "itemname", "sectionname"})
 # Assignment titles (only inside "assignments" lists of list_assignments
 # results): full heuristic Korean-name detection causes false positives on
 # activity titles, so the assignment "name" uses the tenant's
 # assignment_title_heuristic mode (default "title", a weaker heuristic).
 # Known names seeded from the courses' enrolled users are always masked there.
-# Every other title field keeps the full heuristic.
+# _LABEL_FIELDS (name/itemname/sectionname) use the same mode, but only when
+# the call is seeded (assignment_titles=True); unseeded calls keep the full
+# heuristic on every field so a failed seed fails closed. Free-text fields
+# (intro/summary/message/text) always keep the full heuristic.
 _ASSIGNMENT_LIST_KEY = "assignments"
 _ASSIGNMENT_TITLE_KEY = "name"
 
@@ -637,9 +646,10 @@ class Pseudonymizer:
                     and _field_category(key, name_keys) == "name"
                 ):
                     self._seed_name(item)
-                self._seed_from(
-                    item, name_keys, is_user or _is_user_container_key(key)
+                child_user = _is_user_container_key(key) or (
+                    is_user and not isinstance(item, (dict, list, tuple))
                 )
+                self._seed_from(item, name_keys, child_user)
             if is_user:
                 last = lowered.get("lastname")
                 first = lowered.get("firstname")
@@ -670,11 +680,14 @@ class Pseudonymizer:
             out: dict[object, object] = {}
             for item_key, item in value.items():
                 new_key = self.pseudonymize(item_key) if isinstance(item_key, str) else item_key
+                child_user = _is_user_container_key(item_key) or (
+                    is_user and not isinstance(item, (dict, list, tuple))
+                )
                 out[new_key] = self._transform(
                     item,
                     item_key,
                     name_keys,
-                    is_user or _is_user_container_key(item_key),
+                    child_user,
                     assignment_titles,
                     assignment_title_item,
                 )
@@ -703,6 +716,14 @@ class Pseudonymizer:
                     return self._allocate(category, value)
             elif isinstance(key, str) and key.lower() in _PLAIN_OBJECT_FIELDS:
                 return value
+            elif (
+                assignment_titles
+                and isinstance(key, str)
+                and key.lower() in _LABEL_FIELDS
+            ):
+                return self.pseudonymize(
+                    value, heuristic=self.assignment_title_heuristic
+                )
             elif (
                 assignment_title_item
                 and isinstance(key, str)

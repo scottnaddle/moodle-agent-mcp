@@ -268,6 +268,65 @@ def test_no_originals_in_logs(hub, caplog):
     assert "[이름_" not in caplog.text
 
 
+def test_list_students_seeding_does_not_mask_course_outline_names(hub):
+    client, registry = hub
+    registry.add("test2", "https://moodle.test", b"wstoken-2", None, "bearer-2")
+    course_name = "Data Science 101"
+    outline_payload = [
+        {
+            "id": 10,
+            "name": course_name,
+            "summary": "",
+            "modules": [{"id": 20, "name": f"{course_name} Week 1"}],
+        }
+    ]
+
+    def call(tenant, bearer, tool, arguments):
+        return client.post(
+            f"/t/{tenant}/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": tool, "arguments": arguments},
+            },
+            headers={**MCP_HEADERS, "Authorization": f"Bearer {bearer}"},
+        )
+
+    with respx.mock as router:
+        router.post(ENDPOINT).respond(
+            json=[
+                {
+                    "id": 7,
+                    "fullname": "김민수",
+                    "enrolledcourses": [{"id": 1, "fullname": course_name}],
+                }
+            ]
+        )
+        listing = call("test1", "bearer-1", "list_students", {"course_id": 5})
+        assert listing.status_code == 200, listing.text
+        assert "김민수" not in listing.text
+        assert course_name in listing.text
+
+    def outline(tenant, bearer):
+        with respx.mock as router:
+            router.post(ENDPOINT).respond(json=outline_payload)
+            response = call(tenant, bearer, "get_course_outline", {"course_id": 1})
+            assert response.status_code == 200, response.text
+            return response.text
+
+    # Seeding from list_students must not leak into a later get_course_outline:
+    # the polluted tenant must return output identical to a fresh tenant
+    # (after normalizing pseudonym token ids, which differ per tenant).
+    polluted = outline("test1", "bearer-1")
+    fresh = outline("test2", "bearer-2")
+    normalize = lambda text: re.sub(r"\[([^\]_]+)_[0-9a-f]+\]", r"[\1]", text)
+    assert normalize(polluted) == normalize(fresh)
+    assert course_name in fresh
+    assert f"{course_name} Week 1" in fresh
+    assert "[이름_" not in fresh
+
+
 def test_pseudonymizer_store_applies_assignment_title_heuristic(tmp_path):
     kek = Kek(os.urandom(32))
     store = _PseudonymizerStore(Registry.open(str(tmp_path / "hub.sqlite3"), kek), kek)
