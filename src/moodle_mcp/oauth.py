@@ -106,6 +106,8 @@ USER_SERVICE_FUNCTIONS = frozenset(
         "mod_assign_get_submissions",
         "mod_assign_get_grades",
         "mod_assign_save_grade",
+        "local_ubionai_add_quiz_questions",
+        "local_ubionai_add_sections",
         "local_ubionai_create_module",
         "local_ubionai_update_module",
         "local_ubionai_get_course_assignments",
