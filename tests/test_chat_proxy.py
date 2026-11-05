@@ -421,3 +421,73 @@ def test_pseudonymize_off_passes_through(proxy):
         )
     assert response.status_code == 200, response.text
     assert response.json()["choices"][0]["message"]["content"] == text
+
+
+PLAN_PLACES = [
+    {"action": "create_page", "name": "서울 지역 문화 탐방"},
+    {"action": "create_quiz", "name": "Jeju Island field trip"},
+]
+
+
+def test_json_plan_place_names_survive_and_student_name_restored(proxy):
+    client, _ = proxy
+    plan_text = json.dumps({"plan": PLAN_PLACES}, ensure_ascii=False)
+    user_text = f"{plan_text}\n위 계획을 김철수 학생에게 별도 안내로 복사해 줘."
+    seen = {}
+
+    def upstream(request):
+        forwarded = json.loads(request.content)
+        seen["text"] = forwarded["messages"][0]["content"]
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": seen["text"]}}]}
+        )
+
+    with respx.mock as router:
+        router.post(f"{LITELLM_URL}/v1/chat/completions").mock(side_effect=upstream)
+        response = client.post(
+            CHAT.format(site="test2"),
+            json=chat_payload(text=user_text),
+            headers=headers("bearer-2"),
+        )
+    assert response.status_code == 200, response.text
+    upstream_text = seen["text"]
+    assert "김철수" not in upstream_text
+    assert not re.search(r"<[A-Z_]+>", upstream_text)
+    json.loads(upstream_text.splitlines()[0])
+    content = response.json()["choices"][0]["message"]["content"]
+    assert json.loads(content.splitlines()[0])["plan"] == PLAN_PLACES
+    assert content == user_text
+
+
+def test_course_fullname_in_tool_json_passes_through(proxy):
+    client, _ = proxy
+    tool_json = json.dumps(
+        {
+            "name": "create_course",
+            "arguments": {
+                "fullname": "서울 지역 문화 탐방",
+                "summary": "Jeju Island field trip 보충 자료",
+            },
+        },
+        ensure_ascii=False,
+    )
+    seen = {}
+
+    def upstream(request):
+        forwarded = json.loads(request.content)
+        seen["text"] = forwarded["messages"][0]["content"]
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": seen["text"]}}]}
+        )
+
+    with respx.mock as router:
+        router.post(f"{LITELLM_URL}/v1/chat/completions").mock(side_effect=upstream)
+        response = client.post(
+            CHAT.format(site="test2"),
+            json=chat_payload(text=tool_json),
+            headers=headers("bearer-2"),
+        )
+    assert response.status_code == 200, response.text
+    assert seen["text"] != tool_json
+    json.loads(seen["text"])
+    assert response.json()["choices"][0]["message"]["content"] == tool_json
