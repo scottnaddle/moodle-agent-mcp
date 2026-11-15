@@ -433,40 +433,54 @@ async def test_find_activity_by_idnumber_other_errors_pass_through(mcp):
     assert "invalidcourse" in out["error"]
 
 
-async def test_find_activity_by_idnumber_passes_through_get_courses_error(mcp):
-    error = {"exception": "moodle_exception", "errorcode": "accessexception", "message": "Access denied"}
+async def test_find_activity_by_idnumber_without_course_id_makes_no_calls(mcp):
+    from mcp.server.fastmcp.exceptions import ToolError
 
     with respx.mock:
-        respx.post(ENDPOINT).respond(text=json.dumps(error))
-        _content, out = await mcp.call_tool(
-            "find_activity_by_idnumber", {"idnumber": "cs:spec:item"}
+        route = respx.post(ENDPOINT).mock(
+            side_effect=lambda req: respx.MockResponse(text="{}")
         )
+        with pytest.raises(ToolError, match="course_id"):
+            await mcp.call_tool(
+                "find_activity_by_idnumber",
+                {"idnumber": "cs:spec:item", "course_id": None},
+            )
+        calls = [form(c.request) for c in route.calls]
 
-    assert set(out) == {"error"}
-    assert "core_course_get_courses" in out["error"]
-    assert "accessexception" in out["error"]
+    assert calls == []
 
 
-async def test_find_activity_by_idnumber_without_course_id_lists_courses(mcp):
-    courses = {"courses": [{"id": 5}, {"id": 6}]}
-    contents = {
-        5: {"sections": []},
-        6: {"sections": [{"modules": [{"id": 21}]}]},
-    }
+async def test_find_activity_by_idnumber_omitted_course_id_is_rejected(mcp):
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    with respx.mock:
+        route = respx.post(ENDPOINT).mock(
+            side_effect=lambda req: respx.MockResponse(text="{}")
+        )
+        with pytest.raises(ToolError, match="course_id"):
+            await mcp.call_tool(
+                "find_activity_by_idnumber", {"idnumber": "cs:spec:item"}
+            )
+        calls = [form(c.request) for c in route.calls]
+
+    assert calls == []
+
+
+async def test_find_activity_by_idnumber_returns_after_first_match(mcp):
+    contents = {"sections": [{"modules": [{"id": 11}, {"id": 12}, {"id": 13}]}]}
     module = {
         "cm": {
-            "id": 21, "course": 6, "modname": "quiz", "instance": 4,
-            "idnumber": "cs:spec:item", "name": "Quiz", "section": 1, "visible": 1,
+            "id": 11, "course": 5, "modname": "page", "instance": 3,
+            "idnumber": "cs:spec:item", "name": "Reading", "section": 1, "visible": 1,
         }
     }
 
     def reply(req):
         sent = form(req)
-        if sent["wsfunction"] == "core_course_get_courses":
-            return courses
         if sent["wsfunction"] == "core_course_get_contents":
-            return contents[int(sent["courseid"])]
+            return contents
         if sent["wsfunction"] == "core_course_get_course_module":
+            assert sent["cmid"] == "11"
             return module
         raise AssertionError(f"unexpected wsfunction {sent['wsfunction']}")
 
@@ -475,15 +489,43 @@ async def test_find_activity_by_idnumber_without_course_id_lists_courses(mcp):
             side_effect=lambda req: respx.MockResponse(text=json.dumps(reply(req)))
         )
         _content, out = await mcp.call_tool(
-            "find_activity_by_idnumber", {"idnumber": "cs:spec:item"}
+            "find_activity_by_idnumber", {"idnumber": "cs:spec:item", "course_id": 5}
         )
         calls = [form(c.request) for c in route.calls]
 
-    assert out["cmid"] == 21
-    assert out["course"] == 6
-    assert [(c["wsfunction"], c.get("courseid")) for c in calls] == [
-        ("core_course_get_courses", None),
-        ("core_course_get_contents", "5"),
-        ("core_course_get_contents", "6"),
-        ("core_course_get_course_module", None),
+    assert out["cmid"] == 11
+    assert [c["wsfunction"] for c in calls] == [
+        "core_course_get_contents",
+        "core_course_get_course_module",
     ]
+    assert calls[1]["cmid"] == "11"
+
+
+async def test_find_activity_by_idnumber_requires_exact_match(mcp):
+    module = {
+        "cm": {
+            "id": 11, "course": 5, "modname": "page", "instance": 3,
+            "idnumber": "cs:ai-agent-education:w1-reading", "name": "Reading",
+            "section": 1, "visible": 1,
+        }
+    }
+
+    def reply(req):
+        sent = form(req)
+        if sent["wsfunction"] == "core_course_get_contents":
+            return {"sections": [{"modules": [{"id": 11}]}]}
+        if sent["wsfunction"] == "core_course_get_course_module":
+            return module
+        raise AssertionError(f"unexpected wsfunction {sent['wsfunction']}")
+
+    with respx.mock:
+        respx.post(ENDPOINT).mock(
+            side_effect=lambda req: respx.MockResponse(text=json.dumps(reply(req)))
+        )
+        _content, out = await mcp.call_tool(
+            "find_activity_by_idnumber", {"idnumber": "w1-reading", "course_id": 5}
+        )
+
+    assert set(out) == {"error"}
+    assert "no module" in out["error"]
+    assert "w1-reading" in out["error"]

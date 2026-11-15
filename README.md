@@ -45,7 +45,7 @@ flowchart LR
 | 1 | `site_info` | 읽기 | Get Moodle site info and the identity of the web service user. |
 | 2 | `list_courses` | 읽기 | List courses. |
 | 3 | `get_course_outline` | 읽기 | Get the sections and activities/modules of a course. |
-| 4 | `find_activity_by_idnumber` | 읽기 | Find an activity by its CourseSpec idnumber (`cs:<spec>:<item>`). |
+| 4 | `find_activity_by_idnumber` | 읽기 | Find an activity by its exact CourseSpec idnumber (`cs:<spec>:<item>`); `course_id` is required and only that course is searched (no suffix matching). |
 | 5 | `list_students` | 읽기 | List users enrolled in a course (with roles and groups). |
 | 6 | `list_assignments` | 읽기 | List assignments, grouped by course. Courses the service user is not enrolled in use the optional `local_ubionai_get_course_assignments` fallback and are tagged `source: local_ubionai`. |
 | 7 | `get_submissions` | 읽기 | Get submissions for assignments. |
