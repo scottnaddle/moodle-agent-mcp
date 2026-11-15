@@ -11,7 +11,7 @@
 ## 들어 있는 것
 | 경로 | 내용 |
 |---|---|
-| `src/moodle_mcp/`, `tests/` | FastMCP(Python 3.12) Streamable-HTTP MCP 서버 — 도구 **39개**, Bearer 인증 |
+| `src/moodle_mcp/`, `tests/` | FastMCP(Python 3.12) Streamable-HTTP MCP 서버 — 도구 **40개**, Bearer 인증 |
 | `Dockerfile`, `deploy/docker-compose.yml`, `.env.example` | 컨테이너 빌드/실행 |
 | [moodle-local_ubionai](https://github.com/scottnaddle/moodle-local_ubionai) (별도 리포) | 서버가 의존하는 Moodle 로컬 플러그인 `local_ubionai` (v0.1.0, WS 함수 9개). 이전 이름 `local_grokbot` |
 | `moodle-setup/setup_ubionai_ws.php` | Moodle 쪽 자동 설정 CLI (웹서비스·REST·서비스 사용자·역할·외부 서비스·토큰) |
@@ -34,8 +34,8 @@ flowchart LR
   P --- M
 ```
 
-## 도구 목록 (39)
-- 읽기 14 · 쓰기 25. 쓰기 도구는 `confirm=false` 미리보기 → 사람 승인 → `confirm=true` 실행의 2단계입니다. (`grade_submission`/`bulk_grade`는 confirm 인자 없이 승인 후 호출)
+## 도구 목록 (40)
+- 읽기 15 · 쓰기 25. 쓰기 도구는 `confirm=false` 미리보기 → 사람 승인 → `confirm=true` 실행의 2단계입니다. (`grade_submission`/`bulk_grade`는 confirm 인자 없이 승인 후 호출)
 - ⚠️선택 = 선택 플러그인이 필요한 도구. 플러그인이 없어도 서버·설정 스크립트는 정상 동작하고, 해당 도구만 `error` + `hint`를 돌려줍니다.
   - `attendance_sessions` → **mod_attendance**
   - `create_openmaic` → **mod_openmaic**
@@ -45,42 +45,43 @@ flowchart LR
 | 1 | `site_info` | 읽기 | Get Moodle site info and the identity of the web service user. |
 | 2 | `list_courses` | 읽기 | List courses. |
 | 3 | `get_course_outline` | 읽기 | Get the sections and activities/modules of a course. |
-| 4 | `list_students` | 읽기 | List users enrolled in a course (with roles and groups). |
-| 5 | `list_assignments` | 읽기 | List assignments, grouped by course. Courses the service user is not enrolled in use the optional `local_ubionai_get_course_assignments` fallback and are tagged `source: local_ubionai`. |
-| 6 | `get_submissions` | 읽기 | Get submissions for assignments. |
-| 7 | `get_assignment_grades` | 읽기 | Get grades already given for assignments (mod_assign_get_grades). |
-| 8 | `gradebook_overview` | 읽기 | Get gradebook items and grades for a course, optionally for a single user. |
-| 9 | `list_quizzes` | 읽기 | List quizzes in the given courses (omit for all accessible courses). |
-| 10 | `list_quiz_attempts` | 읽기 | List a user's attempts on a quiz. |
-| 11 | `review_attempt` | 읽기 | Get the full review (questions, responses, marks) of a quiz attempt. |
-| 12 | `attendance_sessions` ⚠️선택 | 읽기 | List sessions (and attendance logs) of an attendance activity instance. |
-| 13 | `list_categories` | 읽기 | List course categories (id, name, parent, coursecount). |
-| 14 | `create_course` | 쓰기 | Create a course (core_course_create_courses) and enrol the bot as editingteacher. |
-| 15 | `grade_submission` | 쓰기 | Save a grade and feedback comment for one student's assignment submission. |
-| 16 | `bulk_grade` | 쓰기 | Save grades and feedback for several students of one assignment at once. |
-| 17 | `create_assignment` | 쓰기 | Create an assignment in a course section. |
-| 18 | `create_quiz` | 쓰기 | Create a quiz in a course section. |
-| 19 | `create_forum` | 쓰기 | Create a forum in a course section. |
-| 20 | `create_page` | 쓰기 | Create a page (HTML content) in a course section. |
-| 21 | `create_resource` | 쓰기 | Upload a file and create a file resource in a course section. |
-| 22 | `create_workshop` | 쓰기 | . |
-| 23 | `create_wiki` | 쓰기 | . |
-| 24 | `create_glossary` | 쓰기 | . |
-| 25 | `create_feedback` | 쓰기 | . |
-| 26 | `create_h5pactivity` | 쓰기 | . |
-| 27 | `create_openmaic` ⚠️선택 | 쓰기 | . |
-| 28 | `set_rubric` | 쓰기 | Define (or replace) the rubric of an activity. |
-| 29 | `set_grade_categories` | 쓰기 | Organise the gradebook into weighted categories under the course total and move activities' grade items into them. |
-| 30 | `create_badge` | 쓰기 | Create a course badge awarded when all activity_cmids are completed and/or the course is completed with at least min_course_grade. |
-| 31 | `update_activity` | 쓰기 | Update an activity (local_ubionai_update_module). |
-| 32 | `set_activity_visibility` | 쓰기 | Show or hide an activity on the course page. |
-| 33 | `set_completion` | 쓰기 | Set the completion rule of an activity. |
-| 34 | `set_access_restriction` | 쓰기 | Restrict access to an activity (target = cmid) or a section (target = section number): require completion of required_cmids and/or a start date open_from (unix timestamp). |
-| 35 | `add_quiz_questions` | 쓰기 | Create questions and add them to a quiz (quiz_id = quiz instance id, not cmid). |
-| 36 | `add_sections` | 쓰기 | Append sections to a course. |
-| 37 | `update_section` | 쓰기 | Rename a course section and/or change its summary (HTML). |
-| 38 | `post_forum_discussion` | 쓰기 | Post a new discussion to a forum (forum_id = forum instance id). |
-| 39 | `list_forum_discussions` | 읽기 | List the discussions of a forum (forum instance id) with all their posts. |
+| 4 | `find_activity_by_idnumber` | 읽기 | Find an activity by its CourseSpec idnumber (`cs:<spec>:<item>`). |
+| 5 | `list_students` | 읽기 | List users enrolled in a course (with roles and groups). |
+| 6 | `list_assignments` | 읽기 | List assignments, grouped by course. Courses the service user is not enrolled in use the optional `local_ubionai_get_course_assignments` fallback and are tagged `source: local_ubionai`. |
+| 7 | `get_submissions` | 읽기 | Get submissions for assignments. |
+| 8 | `get_assignment_grades` | 읽기 | Get grades already given for assignments (mod_assign_get_grades). |
+| 9 | `gradebook_overview` | 읽기 | Get gradebook items and grades for a course, optionally for a single user. |
+| 10 | `list_quizzes` | 읽기 | List quizzes in the given courses (omit for all accessible courses). |
+| 11 | `list_quiz_attempts` | 읽기 | List a user's attempts on a quiz. |
+| 12 | `review_attempt` | 읽기 | Get the full review (questions, responses, marks) of a quiz attempt. |
+| 13 | `attendance_sessions` ⚠️선택 | 읽기 | List sessions (and attendance logs) of an attendance activity instance. |
+| 14 | `list_categories` | 읽기 | List course categories (id, name, parent, coursecount). |
+| 15 | `create_course` | 쓰기 | Create a course (core_course_create_courses) and enrol the bot as editingteacher. |
+| 16 | `grade_submission` | 쓰기 | Save a grade and feedback comment for one student's assignment submission. |
+| 17 | `bulk_grade` | 쓰기 | Save grades and feedback for several students of one assignment at once. |
+| 18 | `create_assignment` | 쓰기 | Create an assignment in a course section. |
+| 19 | `create_quiz` | 쓰기 | Create a quiz in a course section. |
+| 20 | `create_forum` | 쓰기 | Create a forum in a course section. |
+| 21 | `create_page` | 쓰기 | Create a page (HTML content) in a course section. |
+| 22 | `create_resource` | 쓰기 | Upload a file and create a file resource in a course section. |
+| 23 | `create_workshop` | 쓰기 | . |
+| 24 | `create_wiki` | 쓰기 | . |
+| 25 | `create_glossary` | 쓰기 | . |
+| 26 | `create_feedback` | 쓰기 | . |
+| 27 | `create_h5pactivity` | 쓰기 | . |
+| 28 | `create_openmaic` ⚠️선택 | 쓰기 | . |
+| 29 | `set_rubric` | 쓰기 | Define (or replace) the rubric of an activity. |
+| 30 | `set_grade_categories` | 쓰기 | Organise the gradebook into weighted categories under the course total and move activities' grade items into them. |
+| 31 | `create_badge` | 쓰기 | Create a course badge awarded when all activity_cmids are completed and/or the course is completed with at least min_course_grade. |
+| 32 | `update_activity` | 쓰기 | Update an activity (local_ubionai_update_module). |
+| 33 | `set_activity_visibility` | 쓰기 | Show or hide an activity on the course page. |
+| 34 | `set_completion` | 쓰기 | Set the completion rule of an activity. |
+| 35 | `set_access_restriction` | 쓰기 | Restrict access to an activity (target = cmid) or a section (target = section number): require completion of required_cmids and/or a start date open_from (unix timestamp). |
+| 36 | `add_quiz_questions` | 쓰기 | Create questions and add them to a quiz (quiz_id = quiz instance id, not cmid). |
+| 37 | `add_sections` | 쓰기 | Append sections to a course. |
+| 38 | `update_section` | 쓰기 | Rename a course section and/or change its summary (HTML). |
+| 39 | `post_forum_discussion` | 쓰기 | Post a new discussion to a forum (forum_id = forum instance id). |
+| 40 | `list_forum_discussions` | 읽기 | List the discussions of a forum (forum instance id) with all their posts. |
 
 ## 관련 작업
 - **mod_openmaic**(OpenMAIC 기반 멀티에이전트 강의 Moodle 활동 플러그인)은 별도로 관리되며 이 리포에는 포함되지 않습니다. 설치돼 있으면 `create_openmaic`이 그 모듈을 만들어 줄 뿐입니다. 필요하면 담당자에게 따로 요청해 주세요.

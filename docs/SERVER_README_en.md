@@ -26,6 +26,7 @@ Token values are never logged or included in error messages. See `.env.example`;
 | `site_info()` | `core_webservice_get_site_info` |
 | `list_courses(ids=None)` | `core_course_get_courses` (`options[ids]`) |
 | `get_course_outline(course_id)` | `core_course_get_contents` |
+| `find_activity_by_idnumber(idnumber, course_id=None)` | `core_course_get_contents`, then `core_course_get_course_module` per cmid |
 | `list_students(course_id)` | `core_enrol_get_enrolled_users` |
 | `list_assignments(course_ids=None)` | `mod_assign_get_assignments`; courses outside the service user's enrolment fall back to `local_ubionai_get_course_assignments` and are tagged `source: local_ubionai` |
 | `get_submissions(assignment_ids, status="")` | `mod_assign_get_submissions` |
@@ -66,6 +67,7 @@ Token values are never logged or included in error messages. See `.env.example`;
 Every tool returns a JSON object. Moodle responses are returned unchanged when they are objects. Lists and nulls are wrapped (for example `{"courses": [...]}`, `{"users": [...]}`, `{"result": null}`), and the write tools add `"ok": true`.
 Moodle errors come back as `{"error": "<wsfunction>: [errorcode] message"}`.
 WRITE tools are described as "only call after the teacher confirmed".
+`find_activity_by_idnumber` is read-only. It looks up an activity's CourseSpec idnumber (`cs:<spec>:<item>`) by collecting cmids with `core_course_get_contents` and then reading each module with `core_course_get_course_module` (per cmid). `get_course_outline` may omit module idnumbers, so use `find_activity_by_idnumber` for idnumber lookups. `core_course_get_course_module` must be present on the Moodle web service.
 Tools marked *preview* take `confirm` (default `false`): without it they return `{"preview": true, ...}`
 describing the change and make no Moodle call; with `confirm=true` they apply it.
 `local_ubionai_*` functions come from the `local_ubionai` Moodle plugin (separate repo https://github.com/scottnaddle/moodle-local_ubionai, install into `local/ubionai`, version 0.1.0 / 2026103100 or later; formerly `local_grokbot`).
