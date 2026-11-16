@@ -49,7 +49,7 @@ async def main():
         async with ClientSession(r, w) as s:
             await s.initialize()
             tools = (await s.list_tools()).tools
-            n = len(tools); good = n == 39; ok += good; fail += not good
+            n = len(tools); good = n == 40; ok += good; fail += not good
             print(f"[{'PASS' if good else 'FAIL'}] list_tools: {n} tools")
             await step(s, "site_info", "site_info", {}, lambda d: "release" in str(d))
             await step(s, "list_categories", "list_categories", {})

@@ -111,7 +111,7 @@ MCP_URL=https://mcp.example.com/mcp MCP_BEARER_TOKEN_FILE=~/.config/moodle-mcp/t
 ```
 - `MCP_URL`을 빼면 `http://127.0.0.1:8791/mcp`(서버 로컬)로 붙습니다. 사설 CA 인증서면 `SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt`(CA를 OS 저장소에 넣은 뒤)처럼 지정하세요.
 
-기대 결과: `list_tools: 39 tools`, site_info/list_categories/list_courses PASS, `--write` 시 `MCP-SMOKE-<ts>` 강좌 + 섹션·페이지·과제 생성 PASS. 끝나면 테스트 강좌는 Moodle에서 삭제하세요.
+기대 결과: `list_tools: 40 tools`, site_info/list_categories/list_courses PASS, `--write` 시 `MCP-SMOKE-<ts>` 강좌 + 섹션·페이지·과제 생성 PASS. 끝나면 테스트 강좌는 Moodle에서 삭제하세요.
 에이전트에게는 "site_info 보여줘", "강좌 목록 보여줘", "테스트 강좌 하나 만들어 줘(미리보기 먼저)" 정도로 확인하면 됩니다.
 
 ## 7. 보안 체크리스트

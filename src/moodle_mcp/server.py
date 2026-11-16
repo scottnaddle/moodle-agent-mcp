@@ -108,6 +108,23 @@ OPTIONAL_HINT = (
     "This tool needs the optional Moodle plugin {plugin}. If it is not installed (or its web service functions "
     "are not in the external service), this tool cannot work; all other tools are unaffected."
 )
+GET_MODULE_UNAVAILABLE_ERRORS = frozenset(
+    {
+        "accessexception",
+        "invalidrecord",
+        "access_denied",
+        "accessdenied",
+        "nopermission",
+        "required_capability_exception",
+        "webservice_access_exception",
+        "functionnotfound",
+        "nofunction",
+    }
+)
+GET_MODULE_UNAVAILABLE_HINT = (
+    "core_course_get_course_module is not available in the Moodle external service; "
+    "add it to the service to enable activity idnumber lookups."
+)
 EDITINGTEACHER_ROLE_ID = int(os.environ.get("MOODLE_EDITINGTEACHER_ROLE_ID") or "3")  # blank in .env -> default
 WRITE_NOTE = "WRITE - only call after the teacher confirmed."
 CONFIRM_NOTE = "Call first with confirm=false to get a preview; call again with confirm=true after the teacher agrees."
@@ -323,6 +340,11 @@ def _wrap(result: Any, key: str = "result") -> dict[str, Any]:
     return result if isinstance(result, dict) else {key: result}
 
 
+def _moodle_errorcode(error: str) -> str | None:
+    match = re.search(r"\[([^\]]+)\]", error or "")
+    return match.group(1) if match else None
+
+
 def _map_strings(value: Any, transform: Any) -> Any:
     """Recursively apply transform to every string value (keys are untouched)."""
     if isinstance(value, str):
@@ -464,8 +486,76 @@ def create_mcp(client: MoodleClient | None) -> FastMCP:
 
     @mcp.tool()
     async def get_course_outline(course_id: int) -> dict[str, Any]:
-        """Get the sections and activities/modules of a course."""
+        """Get the sections and activities/modules of a course.
+
+        core_course_get_contents does not expose module idnumbers; use
+        find_activity_by_idnumber to look up an activity by its CourseSpec idnumber
+        (cs:<spec>:<item>).
+        """
         return await call("core_course_get_contents", key="sections", courseid=course_id)
+
+    @mcp.tool()
+    async def find_activity_by_idnumber(idnumber: str, course_id: int) -> dict[str, Any]:
+        """Find an activity by its exact CourseSpec idnumber (cs:<spec>:<item>). Read-only.
+
+        course_id is required; only that course is searched. Matching is exact string
+        equality, so a suffix such as "w1-reading" does not match
+        "cs:<spec>:w1-reading". Collects cmids with core_course_get_contents, then
+        reads each module's idnumber with core_course_get_course_module and returns
+        as soon as the first exact match is found. Filtering cmids by the
+        get_contents name/modname is deliberately not done: get_contents does not
+        expose idnumbers and live titles are not guaranteed to contain them.
+        """
+        if course_id is None:
+            return {
+                "error": (
+                    "course_id is required; pass the id of the course to search "
+                    "(scans are limited to one course)"
+                )
+            }
+
+        cid = int(course_id)
+        contents = await call("core_course_get_contents", key="sections", courseid=cid)
+        if "error" in contents:
+            return contents
+        cmids: list[int] = []
+        for section in contents.get("sections", []) or []:
+            if not isinstance(section, dict):
+                continue
+            for module in section.get("modules", []) or []:
+                if isinstance(module, dict) and "id" in module:
+                    cmids.append(int(module["id"]))
+
+        for cmid in cmids:
+            detail = await call("core_course_get_course_module", key="cm", cmid=cmid)
+            if "error" in detail:
+                if _moodle_errorcode(detail["error"]) in GET_MODULE_UNAVAILABLE_ERRORS:
+                    return {"error": GET_MODULE_UNAVAILABLE_HINT}
+                return detail
+            wrapped = detail.get("cm")
+            module = wrapped if isinstance(wrapped, dict) else detail
+            if module.get("idnumber") != idnumber:
+                continue
+            module_course = module.get("course")
+            if module_course is not None and int(module_course) != cid:
+                return {
+                    "error": (
+                        f"module {cmid} with idnumber {idnumber!r} belongs to "
+                        f"course {int(module_course)}, not the requested course {cid}"
+                    )
+                }
+            return {
+                "cmid": module.get("id", cmid),
+                "course": int(module_course) if module_course is not None else cid,
+                "modname": module.get("modname"),
+                "instance": module.get("instance"),
+                "idnumber": module.get("idnumber"),
+                "name": module.get("name"),
+                "section": module.get("section"),
+                "visible": module.get("visible"),
+            }
+
+        return {"error": f"no module with idnumber {idnumber!r} found in course {cid}"}
 
     @mcp.tool()
     async def list_students(course_id: int) -> dict[str, Any]:
